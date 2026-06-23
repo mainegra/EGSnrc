@@ -1,0 +1,266 @@
+#!/bin/bash
+###############################################################################
+#
+#  EGSnrc script to submit parallel jobs as individual Slurm jobs
+#  Copyright (C) 2020 National Research Council Canada
+#
+#  This file is part of EGSnrc.
+#
+#  EGSnrc is free software: you can redistribute it and/or modify it under
+#  the terms of the GNU Affero General Public License as published by the
+#  Free Software Foundation, either version 3 of the License, or (at your
+#  option) any later version.
+#
+#  EGSnrc is distributed in the hope that it will be useful, but WITHOUT ANY
+#  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+#  FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for
+#  more details.
+#
+#  You should have received a copy of the GNU Affero General Public License
+#  along with EGSnrc. If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+#
+#  Author:          Frederic Tessier, 2020 (egs-parallel-pbs, adapted from)
+#
+#  Contributors:    Reid Townson
+#                   Ernesto Mainegra-Hing, 2026 (Slurm adaptation)
+#
+###############################################################################
+#
+#  This script is not meant to be called directly, but rather via the script
+#  egs-parallel, with the batch option "--batch slurm"
+#
+###############################################################################
+
+
+### help function
+function help {
+    log "HELP"
+    cat <<EOF
+
+    usage:
+
+        $(basename $0) queue nthread delay first basename 'command' ['others'] [verbose]
+
+    arguments:
+
+        queue       partition name on the Slurm scheduler
+        nthread     number of threads to use (number of jobs)
+        delay       delay in seconds between individual jobs
+        first       first job index
+        basename    simulation input file name, without ".egsinp" extension
+        command     command to run, in quotes
+        others      other options passed to scheduler, in quotes
+        verbose     echo detailed egs-parallel log messages to terminal
+
+    note:
+
+        This script is not meant to be called directly, but rather via the
+        egs-parallel script with the batch option "--batch slurm"
+
+EOF
+}
+
+### timestamp function
+function timestamp {
+    printf "EGSnrc egs-parallel $(date -u "+%Y-%m-%d (UTC) %H:%M:%S.%N")"
+}
+
+### log function to write messages to log file and standard output
+function log {
+    msg="$(timestamp): $1\n"
+    printf "$msg" >&3
+    if [ "$verbosity" = "verbose" ]; then
+        printf "$msg"
+    fi
+}
+
+### quit function for errors, with source, line, message and command
+function quit {
+    lineno=$1
+    msg=$2
+    case $3 in
+        help)  cmd="help";;
+        *)     cmd="";;
+    esac
+    verbosity="verbose"
+    log "$(basename $0): line $lineno: $msg"; $cmd; log "QUIT."; exit 1
+}
+
+### quit function if simulation is done
+function quit_if_done {
+    if [ -r $basename.egsjob ]; then
+        done=$(grep -o END $basename.egsjob)
+        if [ "$done" = "END" ]; then
+            log "$jobstr: QUIT (simulation already finished)"
+            exit
+        fi
+    fi
+}
+
+### Function to check that Slurm is installed and usable
+function check_slurm_version {
+    slurm_version=$(sbatch --version 2>/dev/null)
+    if [[ $? -ne 0 || -z "$slurm_version" ]]; then
+        quit $LINENO "Unable to determine Slurm version. Ensure Slurm is installed and in your PATH."
+    fi
+    log "Detected Slurm version: $slurm_version"
+}
+
+### begin script
+log "BEGIN $0"
+
+### parse command-line arguments (simplistic)
+args_min=6
+if [ "$#" -lt $args_min ]; then
+    quit $LINENO "only $# arguments provided; at least $args_min required" help
+fi
+queue=$1
+nthread=$2
+delay=$3
+first=$4
+basename=$5
+command=$6
+scheduler_options=$7
+verbosity=$8
+
+### Check that Slurm is installed
+check_slurm_version
+
+### link file descriptor 3 to egs-parallel log file
+exec 3>>$basename.egsparallel
+
+### set scheduler job name (skip leading non alnum chars, maximum 14 characters)
+jobname=$(echo "${basename}_n$nthread" | sed 's/^[^[:alnum:]]*//')
+trim=$(( $(echo $jobname | wc -c) - 14 ))
+if [ $trim -gt 0 ]; then
+    jobname=$(echo $jobname | cut -c $trim-)
+    jobname=$(echo $jobname | sed 's/^[^[:alnum:]]*//')
+fi
+log "job name: $jobname"
+
+### remove existing egsjob and lock files
+if [ -e $basename.egsjob ]; then
+    log "remove existing egsjob file: $basename.egsjob"
+    /bin/rm $basename.egsjob
+fi
+if [ -e $basename.lock ]; then
+    log "remove existing lock file: $basename.lock"
+    /bin/rm $basename.lock
+fi
+
+### loop to launch nthread slurm jobs
+for job in $(seq 1 $nthread); do
+
+    # job label
+    jobstr=$(printf "job %04d" $job)
+
+    # job 2 does all the waiting
+    if [ $job -eq 2 ]; then
+
+        # wait a fixed delay (relative to first job)
+        delta=2
+        log "$jobstr: wait $delta seconds (initial delay)"
+        sleep $delta
+
+        # wait until there is an .egsjob file (maximum 120 seconds)
+        total=2
+        delta=10
+        limit=120
+        while [ ! -e $basename.egsjob ]; do
+
+            # quit if simulation is already done
+            quit_if_done
+
+            # otherwise wait for egsjob file
+            log "$jobstr: wait $delta seconds (no $basename.egsjob file after $total seconds)"
+            sleep $delta
+            total=$((total+$delta))
+            if [ $total -gt $limit ]; then
+                log "$jobstr: QUIT (no $basename.egsjob file after $limit seconds)"
+                exit
+            fi
+        done
+    fi
+
+    ### manage jobs to avoid bottleneck and race conditions
+    if [ $job -gt 1 ]; then
+
+        # quit if simulation is already done
+        quit_if_done
+
+        # offset all jobs by a fixed delay (relative to previous job)
+        delta=0.25
+        log "$jobstr: wait $delta seconds (default job offset delay)"
+        sleep $delta
+        quit_if_done
+
+        # extra user-specified delay between each job
+        delta=$delay
+        if [ $delta -gt 0 ]; then
+            log "$jobstr: wait $delta seconds (user job offset delay)"
+            sleep $delta
+        fi
+        quit_if_done
+
+        # report on lock file content
+        if [ -r $basename.lock ]; then
+            content=$(cat $basename.lock | tr -d '\0')
+            log "$jobstr: found $basename.lock: $content"
+        fi
+        quit_if_done
+    fi
+
+    ### launch the job
+    slurmcommand="sbatch --parsable -p $queue $scheduler_options"
+    runcommand="$command -b -P $nthread -j $job -f $first"
+    log "$jobstr: SUBMIT $slurmcommand"
+    log "$jobstr: LAUNCH $runcommand"
+    jobpid=$(eval "$slurmcommand" <<EOF
+#!/bin/bash
+#SBATCH -o ${basename}_w$job.eo
+#SBATCH -e ${basename}_w$job.eo
+#SBATCH -J $jobname
+#SBATCH --export=ALL
+
+### go to slurm submission directory
+cd \$SLURM_SUBMIT_DIR
+
+### log function to write messages to standard output
+function log {
+    printf "EGSnrc egs-parallel \$(date --rfc-3339=ns): \$1\n"
+}
+
+### run command
+$runcommand &
+pid=\$(printf \$!)
+
+### log start
+if [ $job -eq 1 ]; then
+    log "$jobstr: BEGIN host=\$(hostname) pid=\$pid" > \$SLURM_SUBMIT_DIR/$basename.egsjob
+fi
+log "$jobstr: host=\$(hostname) pid=\$pid"
+log "$jobstr: RUN $runcommand"
+
+### wait for completion and log
+wait
+log "$jobstr: DONE."
+if [ $job -eq 1 ]; then
+    log "$jobstr: END host=\$(hostname) pid=\$pid" >> \$SLURM_SUBMIT_DIR/$basename.egsjob
+fi
+EOF
+    )
+
+    # extract and validate the job ID (sbatch --parsable prints "jobid" or "jobid;cluster")
+    jobpid=$(echo "$jobpid" | tail -n 1 | xargs)
+    if ! [[ "$jobpid" =~ ^[0-9]+(;[a-zA-Z0-9._-]+)?$ ]]; then
+        log "FAILED to submit job: $jobpid"
+        if [[ "$job" = "1" ]]; then
+            quit $LINENO "FAILED to submit first job"
+        fi
+    fi
+
+    echo $jobpid
+
+done
