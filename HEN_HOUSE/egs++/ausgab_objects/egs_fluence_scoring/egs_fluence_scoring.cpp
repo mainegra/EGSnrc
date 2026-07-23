@@ -44,7 +44,6 @@
 #include "egs_fluence_scoring.h"
 #include "egs_input.h"
 #include "egs_functions.h"
-#include "egs_advanced_application.h"
 
 static bool EGS_FLUENCE_SCORING_LOCAL inputSet = false;
 
@@ -542,13 +541,10 @@ void EGS_PlanarFluence::setApplication(EGS_Application *App) {
             m_scoring_method = score_crossing;
         }
         else {
-            EGS_AdvancedApplication *adv = dynamic_cast<EGS_AdvancedApplication*>(app);
-            if (adv) {
-                m_i_gmfp = adv->getMFPInterpolators();
-                m_i_cohe = adv->getCoheInterpolators();
-                m_rayleigh_on = adv->isRayleighOn();
-            }
-            else {
+            m_i_gmfp = app->getMFPInterpolators();
+            m_i_cohe = app->getCoheInterpolators();
+            m_rayleigh_on = app->isRayleighOn();
+            if (!m_i_gmfp) {
                 egsWarning("EGS_PlanarFluence: FD scoring requires EGS_AdvancedApplication."
                            " Falling back to crossing estimator.\n");
                 m_scoring_method = score_crossing;
@@ -2368,13 +2364,10 @@ void EGS_SphericalFluence::setApplication(EGS_Application *App) {
             m_scoring_method = score_crossing;
         }
         else {
-            EGS_AdvancedApplication *adv = dynamic_cast<EGS_AdvancedApplication*>(app);
-            if (adv) {
-                m_i_gmfp = adv->getMFPInterpolators();
-                m_i_cohe = adv->getCoheInterpolators();
-                m_rayleigh_on = adv->isRayleighOn();
-            }
-            else {
+            m_i_gmfp = app->getMFPInterpolators();
+            m_i_cohe = app->getCoheInterpolators();
+            m_rayleigh_on = app->isRayleighOn();
+            if (!m_i_gmfp) {
                 egsWarning("EGS_SphericalFluence: FD scoring requires EGS_AdvancedApplication."
                            " Falling back to crossing estimator.\n");
                 m_scoring_method = score_crossing;
