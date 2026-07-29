@@ -763,12 +763,13 @@ void EGS_PlanarFluence::score(const EGS_Particle &p, const int &ivoxel) {
         aup = 0.0871557;    // Limit incident angle to 85 degrees
     }
     EGS_Float e = p.q ? p.E - app->getRM() : p.E;
+    EGS_Float gle = log(e);
     if (flu_s) {
-        e = log(e);   // log scale
+        e = gle;
     }
     EGS_Float ae;
     int je;
-    EGS_Float auxp = p.wt/aup;
+    EGS_Float auxp = p.wt/aup * energyWeight(gle);
     /* Score total fluence in corresponding pixel */
     fluT->score(ivoxel,auxp);
     if (score_primaries && !p.latch) {
@@ -849,7 +850,7 @@ void EGS_PlanarFluence::scoreFD(const EGS_Particle &p, int ixy, EGS_Float dist) 
         aup = m_cos_min;
         ++m_n_clipped;
     }
-    EGS_Float contrib = p.wt * exp(-Lambda) / aup;
+    EGS_Float contrib = p.wt * exp(-Lambda) / aup * energyWeight(gle);
 
     /* In score_both mode write to the separate FD arrays; otherwise to the main arrays. */
     bool both = (m_scoring_method == score_both);
@@ -1890,7 +1891,7 @@ void EGS_VolumetricFluence::scoreInCV() {
                 EGS_Float exp_Att = (mu_cv > 0) ?
                                     exp_Lambda * (1.0 - exp_CV) / mu_cv :
                                     exp_Lambda * tsc;
-                EGS_Float score = wt * wt_att * exp_Att;
+                EGS_Float score = wt * wt_att * exp_Att * energyWeight(gle);
 
                 fluT_FD->score(irsc, score);
                 if (score_primaries && !latch) {
@@ -3074,7 +3075,8 @@ void EGS_SphericalFluence::scoreAtCrossing(const CrossInfo &ci, const EGS_Partic
         aup = m_cos_min;
         ++m_n_clipped;
     }
-    EGS_Float auxp = p.wt / aup;
+    EGS_Float gle  = log(p.q ? p.E - app->getRM() : p.E);
+    EGS_Float auxp = p.wt / aup * energyWeight(gle);
     int k = ci.isph * N_ang + ci.iang;
 
     m_tot += p.wt;
@@ -3161,7 +3163,7 @@ void EGS_SphericalFluence::scoreFD(const EGS_Particle &p) {
                     aup = m_cos_min;
                     ++m_n_clipped;
                 }
-                EGS_Float contrib = p.wt * exp(-Lambda_c) / aup;
+                EGS_Float contrib = p.wt * exp(-Lambda_c) / aup * energyWeight(gle);
                 int k = ci.isph * N_ang + ci.iang;
 
                 /* In score_both mode write to the separate FD arrays. */

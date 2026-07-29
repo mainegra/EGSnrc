@@ -250,6 +250,10 @@ protected:
     bool    verbose,
             score_spe,
             score_primaries;
+
+    /* Hook for kerma-scoring subclasses: multiply each scored weight by
+     * E*muen/rho(E). Base class returns 1 (pure fluence). */
+    virtual EGS_Float energyWeight(EGS_Float /*logE*/) const { return 1.0; }
 };
 
 /*! \brief Ausgab object for scoring fluence at circular or rectangular fields
@@ -738,7 +742,8 @@ public:
                 if (iarg == EGS_Application::BeforeTransport
                         && m_scoring_method != score_FD) {
                     /* Linear track-Length scoring */
-                    EGS_Float wtstep  = app->top_p.wt*app->getTVSTEP();
+                    EGS_Float gle     = log(app->top_p.E);
+                    EGS_Float wtstep  = app->top_p.wt*app->getTVSTEP()*energyWeight(gle);
                     /* Score total fluence */
                     fluT->score(ir,wtstep);
                     m_tot += app->top_p.wt;
