@@ -377,8 +377,8 @@ public:
         }
     };
 
-    inline int hitsField(const EGS_Particle &p, EGS_Float *dist);
-    inline void    score(const EGS_Particle &p, const int &ivoxel);
+    int  hitsField(const EGS_Particle &p, EGS_Float *dist);
+    void score(const EGS_Particle &p, const int &ivoxel);
     void describeMe();//!< Sets fluence scoring object \c description
     void initScoring(EGS_Input *inp);
     void setApplication(EGS_Application *App);
