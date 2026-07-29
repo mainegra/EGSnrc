@@ -73,6 +73,10 @@ public:
     EGS_Float energyWeight(EGS_Float logE) const override {
         return E_Muen_Rho->interpolateFast(logE);
     }
+    string    scoringType()   const override { return "kerma"; }
+    string    columnHeader()  const override { return "K/[Gy]"; }
+    string    quantityUnits() const override { return "Gy"; }
+    EGS_Float outputFactor()  const override { return 1.6021773e-10; }
 
     void loadTable(EGS_Input *inp);
 
@@ -93,6 +97,10 @@ public:
     EGS_Float energyWeight(EGS_Float logE) const override {
         return E_Muen_Rho->interpolateFast(logE);
     }
+    string    scoringType()   const override { return "kerma"; }
+    string    columnHeader()  const override { return "K/[Gy]"; }
+    string    quantityUnits() const override { return "Gy"; }
+    EGS_Float outputFactor()  const override { return 1.6021773e-10; }
 
     void loadTable(EGS_Input *inp);
 
@@ -113,6 +121,10 @@ public:
     EGS_Float energyWeight(EGS_Float logE) const override {
         return E_Muen_Rho->interpolateFast(logE);
     }
+    string    scoringType()   const override { return "kerma"; }
+    string    columnHeader()  const override { return "K/[Gy]"; }
+    string    quantityUnits() const override { return "Gy"; }
+    EGS_Float outputFactor()  const override { return 1.6021773e-10; }
 
     void loadTable(EGS_Input *inp);
 

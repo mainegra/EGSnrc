@@ -254,6 +254,13 @@ protected:
     /* Hook for kerma-scoring subclasses: multiply each scored weight by
      * E*muen/rho(E). Base class returns 1 (pure fluence). */
     virtual EGS_Float energyWeight(EGS_Float /*logE*/) const { return 1.0; }
+
+    /* Output label and unit hooks — override in subclasses to change labels/units. */
+    virtual string scoringType()   const { return "fluence"; }
+    virtual string columnHeader()  const { return "Flu/(MeV*cm2)"; }
+    virtual string quantityUnits() const { return "cm^-2"; }
+    /* Multiply printed values by this factor (e.g. 1.6021773e-10 for MeV/g → Gy). */
+    virtual EGS_Float outputFactor() const { return 1.0; }
 };
 
 /*! \brief Ausgab object for scoring fluence at circular or rectangular fields

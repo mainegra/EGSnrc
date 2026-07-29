@@ -35,6 +35,7 @@
 
 
 #include <string>
+#include <cctype>
 #include <cstdlib>
 #include <limits>
 #include <algorithm>
@@ -714,7 +715,7 @@ void EGS_PlanarFluence::initScoring(EGS_Input *inp) {
 
 void EGS_PlanarFluence::describeMe() {
     char buf[128];
-    sprintf(buf,"\nPlanar %s fluence scoring\n",particle_name.c_str());
+    sprintf(buf,"\nPlanar %s %s scoring\n",particle_name.c_str(),scoringType().c_str());
     description =  buf;
     description += "================================\n";
 
@@ -930,15 +931,18 @@ void EGS_PlanarFluence::ouputPlanarFluence(EGS_ScoringArray *fT, const double &n
     int iy_digits = getDigits(Ny);
     int xy_digits = getDigits(Nx*Ny);
 
+    string ch = columnHeader();
     if (field_type == circle) {
-        egsInformation("\n  pixel#    Flu/(MeV*cm2)   DFlu/(MeV*cm2)\n"
-                       "-----------------------------------------------------\n");
+        egsInformation("\n  pixel#    %s   D%s\n"
+                       "-----------------------------------------------------\n",
+                       ch.c_str(), ch.c_str());
     }
     else {
-        egsInformation("\n  %*s %*s pixel#    Flu/(MeV*cm2)   DFlu/(MeV*cm2)\n"
+        egsInformation("\n  %*s %*s pixel#    %s   D%s\n"
                        "-----------------------------------------------------\n",
-                       iy_digits,"iy",ix_digits,"ix",&count);
+                       iy_digits,"iy",ix_digits,"ix",ch.c_str(),ch.c_str());
     }
+    const double of = outputFactor();
     if (field_type == circle) {
         int k = 0;
         egsInformation("   %*d      ",xy_digits,k);
@@ -949,7 +953,7 @@ void EGS_PlanarFluence::ouputPlanarFluence(EGS_ScoringArray *fT, const double &n
         else {
             dfer = 100;
         }
-        egsInformation(" %10.4le +/- %10.4le [%-7.3lf\%]\n",fe*norma,dfe*norma,dfer);
+        egsInformation(" %10.4le +/- %10.4le [%-7.3lf\%]\n",fe*norma*of,dfe*norma*of,dfer);
     }
     else {
         for (int j=0; j<Ny; j++) {
@@ -963,7 +967,7 @@ void EGS_PlanarFluence::ouputPlanarFluence(EGS_ScoringArray *fT, const double &n
                 else {
                     dfer = 100;
                 }
-                egsInformation(" %10.4le +/- %10.4le [%-7.3lf\%]\n",fe*norma,dfe*norma,dfer);
+                egsInformation(" %10.4le +/- %10.4le [%-7.3lf\%]\n",fe*norma*of,dfe*norma*of,dfer);
             }
         }
     }
@@ -1005,28 +1009,29 @@ void EGS_PlanarFluence::ouputResults() {
 
     //egsInformation("  Normalization = %g\n",norm);
 
-    egsInformation("\n\n            Integral fluence\n"
-                   "            ================\n\n");
+    string st = scoringType();
+    egsInformation("\n\n            Integral %s\n"
+                   "            ================\n\n", st.c_str());
 
     if (m_scoring_method == score_both) {
-        egsInformation("\n\n  [crossing]  Total %s fluence\n", particle_name.c_str());
+        egsInformation("\n\n  [crossing]  Total %s %s\n", particle_name.c_str(), st.c_str());
         ouputPlanarFluence(fluT, norm);
         if (score_primaries) {
-            egsInformation("\n\n  [crossing]  Primary fluence\n");
+            egsInformation("\n\n  [crossing]  Primary %s\n", st.c_str());
             ouputPlanarFluence(fluT_p, norm);
         }
-        egsInformation("\n\n  [FD]        Total %s fluence\n", particle_name.c_str());
+        egsInformation("\n\n  [FD]        Total %s %s\n", particle_name.c_str(), st.c_str());
         ouputPlanarFluence(fluT_FD, norm);
         if (score_primaries) {
-            egsInformation("\n\n  [FD]        Primary fluence\n");
+            egsInformation("\n\n  [FD]        Primary %s\n", st.c_str());
             ouputPlanarFluence(fluT_FD_p, norm);
         }
     }
     else {
-        egsInformation("\n\n               Total %s fluence\n", particle_name.c_str());
+        egsInformation("\n\n               Total %s %s\n", particle_name.c_str(), st.c_str());
         ouputPlanarFluence(fluT, norm);
         if (score_primaries) {
-            egsInformation("\n\n                   Primary fluence\n");
+            egsInformation("\n\n                   Primary %s\n", st.c_str());
             ouputPlanarFluence(fluT_p, norm);
         }
     }
@@ -1074,8 +1079,8 @@ void EGS_PlanarFluence::outputSpectrum(EGS_ScoringArray **fl_set,
     spe_output << "@    subtitle font 4\n";
     spe_output << "@    subtitle size 1.000000\n";
 
-    egsInformation("\n\n            Differential fluence\n"
-                   "            ====================\n\n");
+    egsInformation("\n\n            Differential %s\n"
+                   "            ====================\n\n", scoringType().c_str());
 
     int i_graph = 0;
     double fe, dfe;
@@ -1091,8 +1096,9 @@ void EGS_PlanarFluence::outputSpectrum(EGS_ScoringArray **fl_set,
             spe_output << "@type xydy\n";
             if (verbose) {
                 egsInformation("\n\n           Total \n\n");
-                egsInformation("\n   Emid/MeV    Flu/(MeV*cm2)   DFlu/(MeV*cm2)\n"
-                               "---------------------------------------------\n");
+                egsInformation("\n   Emid/MeV    %s   D%s\n"
+                               "---------------------------------------------\n",
+                               columnHeader().c_str(), columnHeader().c_str());
             }
             for (int l=0; l<flu_nbin; l++) {
                 fl_set[k]->currentResult(l, fe, dfe);
@@ -1106,8 +1112,9 @@ void EGS_PlanarFluence::outputSpectrum(EGS_ScoringArray **fl_set,
             if (score_primaries) {
                 if (verbose) {
                     egsInformation("\n\n           Primary\n\n");
-                    egsInformation("\n   Emid/MeV    Flu/(MeV*cm2)   DFlu/(MeV*cm2)\n"
-                                   "---------------------------------------------\n");
+                    egsInformation("\n   Emid/MeV    %s   D%s\n"
+                                   "---------------------------------------------\n",
+                                   columnHeader().c_str(), columnHeader().c_str());
                 }
                 spe_output << "@    s" << ++i_graph << " errorbar linestyle 0\n";
                 spe_output << "@    s" << i_graph << " legend \"Voxel # " << k << " (primary)\"\n";
@@ -1129,7 +1136,8 @@ void EGS_PlanarFluence::outputSpectrum(EGS_ScoringArray **fl_set,
 }
 
 void EGS_PlanarFluence::reportResults() {
-    egsInformation("\nFluence Scoring (%s)\n",name.c_str());
+    string stype = scoringType(); stype[0] = toupper((unsigned char)stype[0]);
+    egsInformation("\n%s Scoring (%s)\n",stype.c_str(),name.c_str());
     egsInformation("======================================================\n");
     if (m_scoring_method == score_both) {
         egsInformation("   [crossing] Total %ss reaching field:   %g\n",particle_name.c_str(),m_tot);
@@ -1743,7 +1751,7 @@ void EGS_VolumetricFluence::initScoring(EGS_Input *inp) {
 
 void EGS_VolumetricFluence::describeMe() {
     char buf[128];
-    sprintf(buf,"\nVolumetric %s fluence scoring\n",particle_name.c_str());
+    sprintf(buf,"\nVolumetric %s %s scoring\n",particle_name.c_str(),scoringType().c_str());
     description =  buf;
     description += "===================================\n";
 
@@ -1970,8 +1978,11 @@ void EGS_VolumetricFluence::ouputVolumetricFluence(EGS_ScoringArray *fT, const d
 
     //egsInformation("-> norma = %10.4le\n", norma);
 
-    egsInformation("\n  region#    Flu/(MeV*cm2)   DFlu/(MeV*cm2)\n"
-                   "-----------------------------------------------------\n");
+    string ch = columnHeader();
+    egsInformation("\n  region#    %s   D%s\n"
+                   "-----------------------------------------------------\n",
+                   ch.c_str(), ch.c_str());
+    const double of = outputFactor();
     for (int k=0; k<nreg; k++) {
         if (!is_sensitive[k]) {
             continue;
@@ -1985,8 +1996,7 @@ void EGS_VolumetricFluence::ouputVolumetricFluence(EGS_ScoringArray *fT, const d
         else {
             dfer = 100;
         }
-        //egsInformation(" %10.4le +/- %10.4le [%-7.3lf%] %10.4le\n",fe,dfe,dfer,norm);
-        egsInformation(" %10.4le +/- %10.4le [%-7.3lf%]\n",fe*norm,dfe*norm,dfer);
+        egsInformation(" %10.4le +/- %10.4le [%-7.3lf%]\n",fe*norm*of,dfe*norm*of,dfer);
     }
 }
 
@@ -2077,6 +2087,7 @@ void EGS_VolumetricFluence::ouputResults() {
 
     EGS_Float norm  = 1.0/src_norm;              // per particle or fluence
     norm *= norm_u;                    // user-requested normalization
+    const double of = outputFactor();  // unit conversion (e.g. MeV/g → Gy)
 
     flushHistoryCrossTerms();
 
@@ -2114,13 +2125,16 @@ void EGS_VolumetricFluence::ouputResults() {
                           EGS_ScoringArray *fX) {
         bool with_ratio = (fP != nullptr);
         if (with_ratio) {
+            string ch = columnHeader();
+            string tot_col = "total " + ch;
+            string pri_col = "primary " + ch;
             egsInformation("\n\n  %s\n", label);
             egsInformation("  %*s  %-28s  %-28s  %s\n",
-                           ir_digits, "reg#", "total", "primary", "tot/pri");
+                           ir_digits, "reg#", tot_col.c_str(), pri_col.c_str(), "tot/pri");
             egsInformation("  %s\n", string(ir_digits + 2 + 28 + 2 + 28 + 2 + 20, '-').c_str());
             for (int k = 0; k < nreg; k++) {
                 if (!is_sensitive[k]) continue;
-                double nk = norm / volume[k];
+                double nk = norm / volume[k] * of;
                 double Tv, Tu, Pv, Pu, B, Bu;
                 getR(fT, k, nk, Tv, Tu);
                 getR(fP, k, nk, Pv, Pu);
@@ -2136,8 +2150,8 @@ void EGS_VolumetricFluence::ouputResults() {
         }
     };
 
-    egsInformation("\n\n                 Integral fluence output\n"
-                   "                 =======================\n\n");
+    egsInformation("\n\n                 Integral %s output\n"
+                   "                 =======================\n\n", scoringType().c_str());
 
     if (m_scoring_method != score_FD) {
         ouputBlock(score_primaries ? "[track-length]   Total + primary + tot/pri" :
@@ -2193,8 +2207,8 @@ void EGS_VolumetricFluence::ouputResults() {
         spe_output << "@    subtitle size 1.000000\n";
 
         if (verbose)
-            egsInformation("\n\n                 Differential fluence output\n"
-                           "                 =============================\n\n");
+            egsInformation("\n\n                 Differential %s output\n"
+                           "                 =============================\n\n", scoringType().c_str());
         int i_graph = 0;
         double fe, dfe;
         norm *= scoring_charge ? 1 : flu_a;//per bin width <- implicit for charged particles!
@@ -2218,14 +2232,15 @@ void EGS_VolumetricFluence::ouputResults() {
             }
 
             if (verbose) {
-                egsInformation("\nTotal fluence:\n");
+                egsInformation("\nTotal %s:\n", scoringType().c_str());
             }
             spe_output<<"@    s"<< i_graph <<" errorbar linestyle 0\n";
             spe_output<<"@    s"<< i_graph <<" legend \""<< "total (ir # " << j <<")\"\n";
             spe_output<<"@target G0.S"<< i_graph <<"\n";
             spe_output<<"@type xydy\n";
-            if (verbose) egsInformation("\n   Emid/MeV    Flu/(MeV-1*cm-2)   DFlu/(MeV-1*cm-2)\n"
-                                            "---------------------------------------------------\n");
+            if (verbose) egsInformation("\n   Emid/MeV    %s   D%s\n"
+                                            "---------------------------------------------------\n",
+                                            columnHeader().c_str(), columnHeader().c_str());
             for (int i=0; i<flu_nbin; i++) {
                 flu[j]->currentResult(i,fe,dfe);
                 EGS_Float e = (i+0.5-flu_b)/flu_a;
@@ -2240,14 +2255,15 @@ void EGS_VolumetricFluence::ouputResults() {
 
             if (score_primaries) {
                 if (verbose) {
-                    egsInformation("\nPrimary fluence:\n");
+                    egsInformation("\nPrimary %s:\n", scoringType().c_str());
                 }
                 spe_output<<"@    s"<< ++i_graph <<" errorbar linestyle 0\n";
                 spe_output<<"@    s"<< i_graph <<" legend \""<< "primary (ir # " << j <<")\"\n";
                 spe_output<<"@target G0.S"<< i_graph <<"\n";
                 spe_output<<"@type xydy\n";
-                if (verbose) egsInformation("\n   Emid/MeV    Flu/(MeV-1*cm-2)   DFlu/(MeV-1*cm-2)\n"
-                                                "---------------------------------------------------\n");
+                if (verbose) egsInformation("\n   Emid/MeV    %s   D%s\n"
+                                                "---------------------------------------------------\n",
+                                                columnHeader().c_str(), columnHeader().c_str());
                 for (int i=0; i<flu_nbin; i++) {
                     flu_p[j]->currentResult(i,fe,dfe);
                     EGS_Float e = (i+0.5-flu_b)/flu_a;
@@ -2270,8 +2286,8 @@ void EGS_VolumetricFluence::ouputResults() {
 }
 
 void EGS_VolumetricFluence::reportResults() {
-
-    egsInformation("\nFluence Scoring (%s)\n",name.c_str());
+    string stype = scoringType(); stype[0] = toupper((unsigned char)stype[0]);
+    egsInformation("\n%s Scoring (%s)\n",stype.c_str(),name.c_str());
     egsInformation("======================================================\n");
     if (m_scoring_method != score_FD) {
         egsInformation("   [TL]  Total %ss scored: %g\n", particle_name.c_str(), m_tot);
@@ -2892,7 +2908,7 @@ void EGS_SphericalFluence::setApplication(EGS_Application *App) {
 
 void EGS_SphericalFluence::describeMe() {
     char buf[256];
-    sprintf(buf, "\nSpherical %s fluence scoring\n", particle_name.c_str());
+    sprintf(buf, "\nSpherical %s %s scoring\n", particle_name.c_str(), scoringType().c_str());
     description  = buf;
     description += "==================================\n";
 
@@ -3286,12 +3302,13 @@ void EGS_SphericalFluence::ouputSphericalFluence(EGS_ScoringArray *fT,
     double fe, dfe;
     egsInformation("\n  Sphere R = %g cm\n", m_R[isph]);
     egsInformation("  ----------------------\n");
+    const double of = outputFactor();
     for (int iang = 0; iang < N_ang; iang++) {
         int k = isph*N_ang + iang;
         fT->currentResult(k, fe, dfe);
         if (dfe < 0) dfe = 0.0;
         double dfer = (fe > 0) ? 100*dfe/fe : 100;
-        double norm_k = norma / (m_ang_area[iang] * m_R2[isph]);
+        double norm_k = norma / (m_ang_area[iang] * m_R2[isph]) * of;
         int itheta = iang / N_phi;
         int iphi   = iang % N_phi;
         egsInformation("   [theta=%d phi=%d]: %12.5e +/- %-7.3f%%\n",
@@ -3368,12 +3385,13 @@ void EGS_SphericalFluence::ouputResults() {
     const char *dcol = "  %12.5e +/- %-7.3f%%";
     const char *bcol = "  %7.4f +/- %-7.3f%%";
 
+    const double of = outputFactor();
     if (N_ang == 1) {
         // ------------------------------------------------------------------
         // Compact table: one row per sphere
         // ------------------------------------------------------------------
-        egsInformation("\n\n==> Spherical %s fluence [cm^-2 per source particle]\n",
-                       particle_name.c_str());
+        egsInformation("\n\n==> Spherical %s %s [%s per source particle]\n",
+                       particle_name.c_str(), scoringType().c_str(), quantityUnits().c_str());
 
         // ---- Table 1: total fluence ----
         if (both) {
@@ -3392,7 +3410,7 @@ void EGS_SphericalFluence::ouputResults() {
         }
 
         for (int isph = 0; isph < n_sph; isph++) {
-            double nk = norm / (m_ang_area[0] * m_R2[isph]);
+            double nk = norm / (m_ang_area[0] * m_R2[isph]) * of;
             double Tv, Tu;
             getR(fluT, isph, nk, Tv, Tu);
             egsInformation("  %-14.6g", m_R[isph]);
@@ -3431,7 +3449,7 @@ void EGS_SphericalFluence::ouputResults() {
             egsInformation("  %s\n", string(122, '-').c_str());
 
             for (int isph = 0; isph < n_sph; isph++) {
-                double nk = norm / (m_ang_area[0] * m_R2[isph]);
+                double nk = norm / (m_ang_area[0] * m_R2[isph]) * of;
                 double Pv, Pu, FPv, FPu;
                 getR(fluT_p,    isph, nk, Pv,  Pu);
                 getR(fluT_FD_p, isph, nk, FPv, FPu);
@@ -3453,38 +3471,40 @@ void EGS_SphericalFluence::ouputResults() {
         // ------------------------------------------------------------------
         // Block output for angular maps (N_ang > 1)
         // ------------------------------------------------------------------
-        egsInformation("\n\n            Integral fluence [cm^-2 per source particle]\n"
-                       "            ================================================\n\n");
+        string st2 = scoringType();
+        egsInformation("\n\n            Integral %s [%s per source particle]\n"
+                       "            ================================================\n\n",
+                       st2.c_str(), quantityUnits().c_str());
 
         if (both) {
-            egsInformation("\n\n  [crossing]  Total %s fluence\n", particle_name.c_str());
+            egsInformation("\n\n  [crossing]  Total %s %s\n", particle_name.c_str(), st2.c_str());
             for (int isph = 0; isph < n_sph; isph++) {
                 ouputSphericalFluence(fluT, norm, isph);
             }
             if (score_primaries) {
-                egsInformation("\n\n  [crossing]  Primary %s fluence\n", particle_name.c_str());
+                egsInformation("\n\n  [crossing]  Primary %s %s\n", particle_name.c_str(), st2.c_str());
                 for (int isph = 0; isph < n_sph; isph++) {
                     ouputSphericalFluence(fluT_p, norm, isph);
                 }
             }
-            egsInformation("\n\n  [FD]        Total %s fluence\n", particle_name.c_str());
+            egsInformation("\n\n  [FD]        Total %s %s\n", particle_name.c_str(), st2.c_str());
             for (int isph = 0; isph < n_sph; isph++) {
                 ouputSphericalFluence(fluT_FD, norm, isph);
             }
             if (score_primaries) {
-                egsInformation("\n\n  [FD]        Primary %s fluence\n", particle_name.c_str());
+                egsInformation("\n\n  [FD]        Primary %s %s\n", particle_name.c_str(), st2.c_str());
                 for (int isph = 0; isph < n_sph; isph++) {
                     ouputSphericalFluence(fluT_FD_p, norm, isph);
                 }
             }
         }
         else {
-            egsInformation("\n\n               Total %s fluence\n", particle_name.c_str());
+            egsInformation("\n\n               Total %s %s\n", particle_name.c_str(), st2.c_str());
             for (int isph = 0; isph < n_sph; isph++) {
                 ouputSphericalFluence(fluT, norm, isph);
             }
             if (score_primaries) {
-                egsInformation("\n\n                   Primary %s fluence\n", particle_name.c_str());
+                egsInformation("\n\n                   Primary %s %s\n", particle_name.c_str(), st2.c_str());
                 for (int isph = 0; isph < n_sph; isph++) {
                     ouputSphericalFluence(fluT_p, norm, isph);
                 }
@@ -3596,7 +3616,8 @@ void EGS_SphericalFluence::outputSphericalSpectrum(EGS_ScoringArray **fl_set,
 }
 
 void EGS_SphericalFluence::reportResults() {
-    egsInformation("\nFluence Scoring (%s)\n", name.c_str());
+    string stype = scoringType(); stype[0] = toupper((unsigned char)stype[0]);
+    egsInformation("\n%s Scoring (%s)\n", stype.c_str(), name.c_str());
     egsInformation("======================================================\n");
     if (m_scoring_method == score_both) {
         egsInformation("   [crossing] Total %ss crossing sphere(s): %g\n",
