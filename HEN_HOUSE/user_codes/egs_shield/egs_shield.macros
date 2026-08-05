@@ -1,0 +1,28 @@
+
+/*
+###############################################################################
+#
+#  EGSnrc egs++ egs_shield application — user macros
+#  Copyright (C) 2026 National Research Council Canada
+#
+#  This file is part of EGSnrc.
+#
+#  EGSnrc is free software: you can redistribute it and/or modify it under
+#  the terms of the GNU Affero General Public License as published by the
+#  Free Software Foundation, either version 3 of the License, or (at your
+#  option) any later version.
+#
+###############################################################################
+*/
+
+/*
+   Redirect the $SELECT-PHOTON-MFP macro to the C++ implementation.
+   This fires at the start of every photon free path and is where FD
+   scoring happens in EGS_ShieldApplication::selectPhotonMFP().
+   Without this override the Mortran default MFP sampling runs instead
+   and the C++ selectPhotonMFP is never called.
+*/
+REPLACE {$SELECT-PHOTON-MFP;} WITH {;
+    call select_photon_mfp(dpmfp);
+    IF( dpmfp < 0 ) return;
+};
