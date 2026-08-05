@@ -43,7 +43,7 @@
 #      is killed upon entry.  Containers are snapshot-swapped and combed
 #      between iterations.
 #
-#  Algorithm (Divide et Impera, extended for backscatter):
+#  Algorithm (Population-controlled batch FD):
 #
 #    For each of n_bunches independent bunches of n_per_bunch source photons:
 #
