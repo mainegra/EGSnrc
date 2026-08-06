@@ -73,7 +73,7 @@
 #        geometry name     = iron_sphere
 #        scoring regions   = 1 3 5 7 9 ...   # 0-based, thin air scoring shells
 #        scoring volumes   = 0.5 0.5 ...     # cm^3, one per scoring shell
-#        combing regions   = 9 19 29 ...     # subset of scoring region indices
+#        combing regions   = 41 49 ...       # thin iron regions between scoring positions (NOT scoring shells)
 #        emuen file        = $EGS_HOME/egs_kerma/emuen_rho_air_1keV-20MeV.data
 #        n bunches         = 100
 #        photons per bunch = 1000000
@@ -83,7 +83,6 @@
 */
 
 #include "egs_advanced_application.h"
-#include "egs_scoring.h"
 #include "egs_interface2.h"
 #include "egs_functions.h"
 #include "egs_input.h"
@@ -203,12 +202,11 @@ public:
           n_combing(0), combing_reg(nullptr), combing_idx(nullptr),
           is_combing(nullptr),
           containers(nullptr), snapshots(nullptr),
-          kerma_tot(nullptr), kerma_pri(nullptr),
           E_Muen_Rho(nullptr),
           n_bunches(100), n_per_bunch(1000000LL),
           current_bunch(0),
           K_bunch(nullptr), Kp_bunch(nullptr),
-          last_case(0)
+          total_cpu_time_(0.0)
     {}
 
     ~EGS_ShieldApplication();
@@ -265,14 +263,7 @@ public:
 
 protected:
     int startNewShower() override {
-        int res = EGS_Application::startNewShower();
-        if (res) return res;
-        if (current_case != last_case) {
-            if (kerma_tot) kerma_tot->setHistory(current_case);
-            if (kerma_pri) kerma_pri->setHistory(current_case);
-            last_case = current_case;
-        }
-        return 0;
+        return EGS_AdvancedApplication::startNewShower();
     }
 
 private:
@@ -296,9 +287,15 @@ private:
     TmpPhsp **containers;     // [n_combing]: filled during current replay pass
     TmpPhsp **snapshots;      // [n_combing]: particles being replayed this iteration
 
-    // ---- Per-bunch scoring (reset after each bunch) ----
-    EGS_ScoringArray *kerma_tot;
-    EGS_ScoringArray *kerma_pri;
+    // ---- Per-bunch kerma accumulators (reset at the end of each bunch) ----
+    // Plain sums, normalized by n_per_bunch in endBunch().  Using
+    // EGS_ScoringArray here was wrong: currentResult() divides by the last
+    // setHistory() argument (cumulative source-photon index), not by
+    // n_per_bunch, so the denominator grew with every bunch and included
+    // replay-photon increments — giving K values that are ~5× too small
+    // while BUF was unaffected (same wrong denominator in numerator/denominator).
+    vector<double> sum_tot;
+    vector<double> sum_pri;
 
     // ---- E*mu_en/rho interpolator (log E abscissa) ----
     EGS_Interpolator *E_Muen_Rho;
@@ -307,10 +304,10 @@ private:
     int       n_bunches;
     long long n_per_bunch;
     int       current_bunch;
-    double  **K_bunch;    // [n_bunches][n_scoring]
-    double  **Kp_bunch;   // [n_bunches][n_scoring]
+    double  **K_bunch;         // [n_bunches][n_scoring]
+    double  **Kp_bunch;        // [n_bunches][n_scoring]
+    double    total_cpu_time_; // accumulated wall/CPU time over all bunches [s]
 
-    EGS_I64 last_case;
 
     /*------------------------------------------------------------------------
       scoreFD_all
@@ -320,7 +317,7 @@ private:
 
       At each scoring shell encountered:
         score += w * exp(-Lambda) * (E*muen/rho) * t_shell / V_shell[k]
-        added to kerma_pri (primary) or kerma_tot (scattered).
+        accumulated in sum_pri (primary) or sum_tot (total).
 
       For scattered photons only — stop at the first combing shell hit:
         save a virtual photon at the shell EXIT (iron side) with weight
@@ -412,8 +409,8 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
                 EGS_Float emuen_rho = E_Muen_Rho->interpolateFast(gle);
                 EGS_Float score = wt * std::exp(-Lambda) * emuen_rho
                                   * t_shell / V_shell[k];
-                kerma_tot->score(k, score);        // total = primary + scattered
-                if (is_primary) kerma_pri->score(k, score);
+                sum_tot[k] += score;               // total = primary + scattered
+                if (is_primary) sum_pri[k] += score;
             }
 
             // Traverse the scoring shell (air attenuation negligible, no Lambda update).
@@ -564,9 +561,9 @@ int EGS_ShieldApplication::initScoring() {
         is_combing[r]  = true;
     }
 
-    // ---- Scoring arrays ----
-    kerma_tot = new EGS_ScoringArray(n_scoring);
-    kerma_pri = new EGS_ScoringArray(n_scoring);
+    // ---- Kerma accumulators ----
+    sum_tot.assign(n_scoring, 0.0);
+    sum_pri.assign(n_scoring, 0.0);
 
     // ---- Containers and snapshot buffers ----
     containers = new TmpPhsp*[n_combing];
@@ -711,15 +708,20 @@ int EGS_ShieldApplication::runSimulation() {
             for (int m = 0; m < n_combing; m++) {
                 std::swap(containers[m], snapshots[m]);
                 containers[m]->clean();
-                snapshots[m]->comb(rndm, comb_target);
+                // Cap at current size: don't split when np < comb_target.
+                // Splitting would create a fixed-cost 100K-shower replay
+                // regardless of n_per_bunch, breaking time scaling.
+                snapshots[m]->comb(rndm, std::min(snapshots[m]->size(), comb_target));
             }
             for (int m = 0; m < n_combing; m++)
                 if (snapshots[m]->size() > 0)
                     replayContainer(snapshots[m]);
         }
 
+        double bunch_time = timer.time();
+        total_cpu_time_ += bunch_time;
         endBunch();
-        egsInformation("  %.1f s\n", timer.time());
+        egsInformation("  %.1f s\n", bunch_time);
     }
     return 0;
 }
@@ -730,14 +732,11 @@ int EGS_ShieldApplication::runSimulation() {
 ----------------------------------------------------------------------------*/
 void EGS_ShieldApplication::endBunch() {
     for (int k = 0; k < n_scoring; k++) {
-        double r, dr;
-        kerma_tot->currentResult(k, r, dr);
-        K_bunch[current_bunch][k] = r;
-        kerma_pri->currentResult(k, r, dr);
-        Kp_bunch[current_bunch][k] = r;
+        K_bunch[current_bunch][k]  = sum_tot[k] / n_per_bunch;
+        Kp_bunch[current_bunch][k] = sum_pri[k] / n_per_bunch;
+        sum_tot[k] = 0.0;
+        sum_pri[k] = 0.0;
     }
-    kerma_tot->reset();
-    kerma_pri->reset();
 }
 
 
@@ -748,9 +747,10 @@ void EGS_ShieldApplication::outputResults() {
     static const double MeVtoGy = 1.6021773e-10;
 
     egsInformation("\n");
-    egsInformation("  %-6s  %-14s  %-14s  %-12s  %-10s\n",
-                   "Shell", "K_tot/[Gy]", "K_pri/[Gy]", "BUF", "sigma/%");
-    egsInformation("  %s\n", string(60, '-').c_str());
+    egsInformation("  %-6s  %-14s  %-14s  %-12s  %-10s  %-12s\n",
+                   "Shell", "K_tot/[Gy]", "K_pri/[Gy]", "BUF", "sigma/%",
+                   "FOM/[s^-1]");
+    egsInformation("  %s\n", string(74, '-').c_str());
 
     for (int k = 0; k < n_scoring; k++) {
         double sum_buf  = 0.0;
@@ -781,10 +781,25 @@ void EGS_ShieldApplication::outputResults() {
         Kt_mean /= n_valid;
         Kp_mean /= n_valid;
 
-        egsInformation("  %-6d  %-14.6g  %-14.6g  %-12.6g  %-10.4f\n",
+        double sigma_frac = sem / std::max(mean, 1e-30);
+        double fom = (total_cpu_time_ > 0 && sigma_frac > 0)
+                     ? 1.0 / (sigma_frac * sigma_frac * total_cpu_time_)
+                     : 0.0;
+
+        egsInformation("  %-6d  %-14.6g  %-14.6g  %-12.6g  %-10.4f  %-12.4g\n",
                        k, Kt_mean * MeVtoGy, Kp_mean * MeVtoGy, mean,
-                       100.0 * sem / std::max(mean, 1e-30));
+                       100.0 * sigma_frac, fom);
     }
+
+    // ---- Speed and efficiency summary ----
+    long long total_source = (long long)n_bunches * n_per_bunch;
+    double speed = (total_cpu_time_ > 0)
+                   ? total_source / total_cpu_time_ : 0.0;
+    egsInformation("\n");
+    egsInformation("  Source photons: %lld  |  CPU: %.1f s  |  Speed: %.0f photons/s\n",
+                   total_source, total_cpu_time_, speed);
+    egsInformation("  FOM = 1/(sigma_BUF^2 * T);  higher is better."
+                   "  Expect ~constant with depth for this algorithm.\n");
     egsInformation("\n");
 }
 
@@ -793,8 +808,6 @@ void EGS_ShieldApplication::outputResults() {
   Destructor
 ----------------------------------------------------------------------------*/
 EGS_ShieldApplication::~EGS_ShieldApplication() {
-    delete kerma_tot;
-    delete kerma_pri;
     delete E_Muen_Rho;
 
     delete [] scoring_reg;
