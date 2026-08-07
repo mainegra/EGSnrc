@@ -1,0 +1,236 @@
+##############################################################################
+#
+# egs_shield deep-penetration test: 1 MeV photons in iron sphere.
+# 24 scoring shells: fine section (0.5–10 mfp, 0.5-mfp steps) +
+#                    coarse section (15, 20, 25, 30 mfp).
+# 2 independent combing iron shells at 12.5 and 22.5 mfp (10 mfp spacing),
+# placed BETWEEN scoring shell positions (not coinciding with them).
+#
+# Design rationale for 10 mfp spacing:
+#   Stage 0 FD: scores shells 0.5–10 mfp (stops at combing shell 0 at 12.5 mfp).
+#   Stage 1 replay (from 12.5 mfp): FD scores 15 + 20 mfp shells,
+#     stops at combing shell 1 at 22.5 mfp.
+#   Stage 2 replay (from 22.5 mfp): FD scores 25 + 30 mfp shells,
+#     no further combing → exits geometry.
+#   Backscatter loop convergence ∝ exp(-10 mfp × k) per iteration k → 6 iterations.
+#
+# MFP in iron at 1 MeV ≈ 2.12 cm.
+#
+# Region layout (0-based C++ indices, egs_spheres):
+#   Fine section (regions 0–39, unchanged from 10 mfp test):
+#    0: iron  (0 → 1.059985 cm)
+#    1: air   0.5 mfp   [scoring  0]
+#    2: iron
+#    3: air   1.0 mfp   [scoring  1]
+#   ...
+#   38: iron
+#   39: air  10.0 mfp   [scoring 19]
+#
+#   Coarse section:
+#   40: iron  (21.200750 → 26.500000 cm)
+#   41: iron  (26.500000 → 26.501000 cm) ← combing shell 0  (~12.5 mfp)
+#   42: iron  (26.501000 → 31.801000 cm)
+#   43: air   15.0 mfp  [scoring 20]
+#   44: iron  (31.801100 → 37.100000 cm)
+#   45: iron  (37.100000 → 37.101000 cm)   [thin iron, NOT combing]
+#   46: iron  (37.101000 → 42.401350 cm)
+#   47: air   20.0 mfp  [scoring 21]
+#   48: iron  (42.401450 → 47.700000 cm)
+#   49: iron  (47.700000 → 47.701000 cm) ← combing shell 1  (~22.5 mfp)
+#   50: iron  (47.701000 → 53.001700 cm)
+#   51: air   25.0 mfp  [scoring 22]
+#   52: iron  (53.001800 → 58.300000 cm)
+#   53: iron  (58.300000 → 58.301000 cm)   [thin iron, NOT combing]
+#   54: iron  (58.301000 → 63.602050 cm)
+#   55: air   30.0 mfp  [scoring 23]
+#   56: iron  (63.602150 → 84.802750 cm) ← outer absorber (~40 mfp)
+#
+# Shell volumes V = 4*pi*r_inner^2 * 0.0001 cm (100 um air shells).
+# Combing shells are 0.001 cm thick iron — negligible attenuation.
+#
+# Reference BUF (egs_kerma eTLE, no IS, Appendix C):
+#   10 mfp: 16.912 ± 0.011%    15 mfp: 30.304 ± 0.099%
+#   20 mfp: 46.194 ± 1.02%     25 mfp: 59.586 ± 8.9%
+#   30 mfp: ~292 (unreliable — egs_shield target)
+#
+##############################################################################
+
+:start run control:
+    ncase = 5e7
+    nbatch = 1
+    rco type = uniform
+    interval wait time  = 30000    # 30 s between checks
+    number of intervals = 60       # up to 30 min wait
+:stop run control:
+
+##############################################################################
+### Geometry
+##############################################################################
+:start geometry definition:
+
+    :start geometry:
+        name    = iron_sphere
+        library = egs_spheres
+        radii   = \
+            1.059985  1.060085 \
+            2.120020  2.120120 \
+            3.180055  3.180155 \
+            4.240090  4.240190 \
+            5.300125  5.300225 \
+            6.360160  6.360260 \
+            7.420195  7.420295 \
+            8.480230  8.480330 \
+            9.540265  9.540365 \
+            10.60030  10.60040 \
+            11.660335 11.660435 \
+            12.720370 12.720470 \
+            13.780405 13.780505 \
+            14.840440 14.840540 \
+            15.900475 15.900575 \
+            16.960510 16.960610 \
+            18.020545 18.020645 \
+            19.080580 19.080680 \
+            20.140615 20.140715 \
+            21.200650 21.200750 \
+            26.500000 26.501000 \
+            31.801000 31.801100 \
+            37.100000 37.101000 \
+            42.401350 42.401450 \
+            47.700000 47.701000 \
+            53.001700 53.001800 \
+            58.300000 58.301000 \
+            63.602050 63.602150 \
+            84.802750
+
+        :start media input:
+            media   = iron air
+            set medium =  1  1
+            set medium =  3  1
+            set medium =  5  1
+            set medium =  7  1
+            set medium =  9  1
+            set medium = 11  1
+            set medium = 13  1
+            set medium = 15  1
+            set medium = 17  1
+            set medium = 19  1
+            set medium = 21  1
+            set medium = 23  1
+            set medium = 25  1
+            set medium = 27  1
+            set medium = 29  1
+            set medium = 31  1
+            set medium = 33  1
+            set medium = 35  1
+            set medium = 37  1
+            set medium = 39  1
+            set medium = 43  1
+            set medium = 47  1
+            set medium = 51  1
+            set medium = 55  1
+        :stop media input:
+    :stop geometry:
+
+    simulation geometry = iron_sphere
+
+:stop geometry definition:
+
+##############################################################################
+### Media
+##############################################################################
+:start media definition:
+
+    ae = 0.521
+    ue = 2.511
+    ap = 0.010
+    up = 2.0
+
+    :start iron:
+        density correction file = iron
+    :stop iron:
+
+    :start air:
+        density correction file = air_dry_nearsealevel
+    :stop air:
+
+:stop media definition:
+
+##############################################################################
+### Source — isotropic point source at origin
+##############################################################################
+:start source definition:
+
+    :start source:
+        name      = point_source
+        library   = egs_isotropic_source
+        charge    = 0
+        :start spectrum:
+            type   = monoenergetic
+            energy = 1
+        :stop spectrum:
+        :start shape:
+            type     = point
+            position = 0 0 0
+        :stop shape:
+    :stop source:
+
+    simulation source = point_source
+
+:stop source definition:
+
+:start rng definition:
+    type = xoshiro256++
+    initial seeds = 54321 98765
+:stop rng definition:
+
+##############################################################################
+### Scoring options
+##############################################################################
+:start scoring options:
+
+    geometry name     = iron_sphere
+
+    # 24 scoring shells: 20 fine (0.5–10 mfp) + 4 coarse (15, 20, 25, 30 mfp)
+    scoring regions   = \
+         1  3  5  7  9  11 13 15 17 19 \
+        21 23 25 27 29  31 33 35 37 39 \
+        43 47 51 55
+
+    # V = 4*pi*r_inner^2 * 0.0001 cm^3  (100 um shells)
+    scoring volumes   = \
+        1.412E-03  5.648E-03  1.271E-02  2.259E-02  3.530E-02 \
+        5.083E-02  6.919E-02  9.037E-02  1.144E-01  1.412E-01 \
+        1.709E-01  2.033E-01  2.386E-01  2.768E-01  3.177E-01 \
+        3.615E-01  4.081E-01  4.575E-01  5.097E-01  5.648E-01 \
+        1.2707E+00 2.2593E+00 3.5301E+00 5.0836E+00
+
+    # 2 combing shells at 12.5 and 22.5 mfp (regions 41, 49).
+    # 10 mfp spacing ensures fast convergence of the backscatter loop.
+    # Stage 1 FD (from 12.5 mfp) scores 15 + 20 mfp.
+    # Stage 2 FD (from 22.5 mfp) scores 25 + 30 mfp.
+    combing regions   = 41 49
+
+    emuen file        = $EGS_HOME/egs_kerma/emuen_rho_air_1keV-20MeV.data
+
+    n bunches         = 100
+    photons per bunch = 1000000
+
+:stop scoring options:
+
+:start variance reduction:
+:stop variance reduction:
+
+:start MC transport parameter:
+    Global ECUT                  = 0.521
+    Global PCUT                  = 0.010
+    Rayleigh scattering          = On
+    Photoelectron angular sampling = Off
+    Brems angular sampling       = Simple
+    Bound Compton scattering     = norej
+    Pair angular sampling        = Off
+    ESTEPE                       = 0.25
+    XIMAX                        = 0.5
+    Skin depth for BCA           = 3
+    Boundary crossing algorithm  = EXACT
+    Electron-step algorithm      = PRESTA-II
+:stop MC transport parameter:

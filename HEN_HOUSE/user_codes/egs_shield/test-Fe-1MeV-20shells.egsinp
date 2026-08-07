@@ -1,44 +1,33 @@
 ##############################################################################
 #
-# egs_shield smoke test: 1 MeV photons in iron sphere, 5 scoring shells
-# (0.5, 1.0, 1.5, 2.0, 2.5 mfp), 1 combing shell at ~3 mfp.
+# egs_shield validation: 1 MeV photons in iron sphere, 20 scoring shells
+# (0.5, 1.0, ..., 10.0 mfp in 0.5-mfp steps), 1 combing shell at ~12.5 mfp.
 #
-# The combing shell (region 11) is a thin iron region BETWEEN scoring positions.
+# The combing shell (region 41) is a thin iron region BETWEEN scoring positions.
 # It must NOT coincide with a scoring shell (backward-replay double-counting)
-# and must have an iron buffer (region 10) between it and the last scoring
+# and must have an iron buffer (region 40) between it and the last scoring
 # shell so that replayed virtual photons start in iron — not inside an air
-# scoring shell — allowing scoreFD_all to trace inward and score shell 4.
+# scoring shell — allowing scoreFD_all to trace inward and score shell 19.
+#
+# MFP in iron at 1 MeV ≈ 2.12 cm.
 #
 # Region layout (0-based C++ indices):
-#   Region 0:  iron (0 to 1.059985 cm)
-#   Region 1:  air shell 0.5 mfp   [scoring]
-#   Region 2:  iron
-#   Region 3:  air shell 1.0 mfp   [scoring]
-#   Region 4:  iron
-#   Region 5:  air shell 1.5 mfp   [scoring]
-#   Region 6:  iron
-#   Region 7:  air shell 2.0 mfp   [scoring]
-#   Region 8:  iron
-#   Region 9:  air shell 2.5 mfp   [scoring, NOT combing]
-#   Region 10: iron buffer (5.300225 to 6.360160 cm)
-#   Region 11: thin iron combing shell (~3 mfp, 0.001 cm thick) [combing]
-#   Region 12: outer iron absorber
+#   0:  iron (0 to 1.059985 cm)
+#   1:  air 0.5 mfp    [scoring]
+#   2:  iron
+#   ...
+#   38: iron
+#   39: air 10.0 mfp   [scoring, NOT combing]
+#   40: iron buffer (21.200750 to 26.500000 cm, ≈ 10–12.5 mfp)
+#   41: thin iron combing shell (26.500000 to 26.501000 cm, 0.001 cm) [combing]
+#   42: outer iron absorber (26.501000 to 53.001700 cm)
 #
 # Shell volumes V = 4*pi*r_inner^2 * 0.0001 cm (100 um thick shells).
-# Computed from masses in BUF input (m / rho_air, rho_air = 1.20479e-3 g/cm3):
-#   k=0 (0.5 mfp): m=1.7012E-06 g => V=1.412E-03 cm3
-#   k=1 (1.0 mfp): m=6.8049E-06 g => V=5.648E-03 cm3
-#   k=2 (1.5 mfp): m=1.5311E-05 g => V=1.271E-02 cm3
-#   k=3 (2.0 mfp): m=2.7220E-05 g => V=2.260E-02 cm3
-#   k=4 (2.5 mfp): m=4.2531E-05 g => V=3.530E-02 cm3
 #
 ##############################################################################
 
-##############################################################################
-### Run control — 10M photons (quick smoke test, ~1 min)
-##############################################################################
 :start run control:
-    ncase = 1e7
+    ncase = 1e8
     nbatch = 1
     rco type = uniform
     interval wait time  = 30000    # 30 s between checks
@@ -46,7 +35,7 @@
 :stop run control:
 
 ##############################################################################
-### Geometry — 5 scoring shells (10 iron+air pairs + outermost iron)
+### Geometry — 20 scoring shells (fine section, 0.5–10 mfp)
 ##############################################################################
 :start geometry definition:
 
@@ -58,16 +47,46 @@
                   3.180055 3.180155 \
                   4.240090 4.240190 \
                   5.300125 5.300225 \
-                  6.360160 6.361160 \
+                  6.360160 6.360260 \
+                  7.420195 7.420295 \
+                  8.480230 8.480330 \
+                  9.540265 9.540365 \
+                  10.60030 10.60040 \
+                  11.660335 11.660435 \
+                  12.720370 12.720470 \
+                  13.780405 13.780505 \
+                  14.840440 14.840540 \
+                  15.900475 15.900575 \
+                  16.960510 16.960610 \
+                  18.020545 18.020645 \
+                  19.080580 19.080680 \
+                  20.140615 20.140715 \
+                  21.200650 21.200750 \
+                  26.500000 26.501000 \
                   53.001700
 
         :start media input:
             media   = iron air
-            set medium = 1  1
-            set medium = 3  1
-            set medium = 5  1
-            set medium = 7  1
-            set medium = 9  1
+            set medium =  1  1
+            set medium =  3  1
+            set medium =  5  1
+            set medium =  7  1
+            set medium =  9  1
+            set medium = 11  1
+            set medium = 13  1
+            set medium = 15  1
+            set medium = 17  1
+            set medium = 19  1
+            set medium = 21  1
+            set medium = 23  1
+            set medium = 25  1
+            set medium = 27  1
+            set medium = 29  1
+            set medium = 31  1
+            set medium = 33  1
+            set medium = 35  1
+            set medium = 37  1
+            set medium = 39  1
         :stop media input:
     :stop geometry:
 
@@ -124,25 +143,28 @@
 :stop rng definition:
 
 ##############################################################################
-### Scoring options (egs_shield format)
+### Scoring options
 ##############################################################################
 :start scoring options:
 
     geometry name     = iron_sphere
 
-    # 0-based C++ region indices of the thin air scoring shells
-    scoring regions   = 1 3 5 7 9
+    # 0-based C++ region indices of the 20 thin air scoring shells
+    scoring regions   = 1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39
 
-    # Shell volumes [cm^3], one per scoring shell
-    scoring volumes   = 1.412E-03 5.648E-03 1.271E-02 2.260E-02 3.530E-02
+    # Shell volumes [cm^3] = 4*pi*r_inner^2 * 0.0001, one per scoring shell
+    scoring volumes   = 1.412E-03 5.648E-03 1.271E-02 2.259E-02 3.530E-02 \
+                        5.083E-02 6.919E-02 9.037E-02 1.144E-01 1.412E-01 \
+                        1.709E-01 2.033E-01 2.386E-01 2.768E-01 3.177E-01 \
+                        3.615E-01 4.081E-01 4.575E-01 5.097E-01 5.648E-01
 
-    # Combing shell — thin iron region at ~3 mfp (region 11), NOT a scoring shell
-    combing regions   = 11
+    # Combing shell — thin iron region at ~12.5 mfp (region 41), NOT a scoring shell
+    combing regions   = 41
 
     emuen file        = $EGS_HOME/egs_kerma/emuen_rho_air_1keV-20MeV.data
 
     n bunches         = 20
-    photons per bunch = 100000
+    photons per bunch = 500000
 
 :stop scoring options:
 

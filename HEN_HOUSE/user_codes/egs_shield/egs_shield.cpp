@@ -204,8 +204,9 @@ public:
           containers(nullptr), snapshots(nullptr),
           E_Muen_Rho(nullptr),
           n_bunches(100), n_per_bunch(1000000LL),
-          current_bunch(0),
-          K_bunch(nullptr), Kp_bunch(nullptr),
+          current_bunch(0), n_completed(0),
+          sum_ratio(nullptr), sum_ratio2(nullptr),
+          sum_Kt(nullptr), sum_Kp(nullptr), n_valid_b(nullptr),
           total_cpu_time_(0.0)
     {}
 
@@ -257,9 +258,15 @@ public:
         dpmfp = -std::log(1.0 - rndm->getUniform());
     }
 
-    int  initScoring()   override;
-    int  runSimulation() override;
-    void outputResults() override;
+    int  initScoring()         override;
+    int  initRunControl()      override;
+    int  runSimulation()       override;
+    int  finishSimulation()    override;
+    void outputResults()       override;
+    int  outputData()          override;
+    int  readData()            override;
+    int  addState(istream &d)  override;
+    void resetCounter()        override;
 
 protected:
     int startNewShower() override {
@@ -304,9 +311,14 @@ private:
     int       n_bunches;
     long long n_per_bunch;
     int       current_bunch;
-    double  **K_bunch;         // [n_bunches][n_scoring]
-    double  **Kp_bunch;        // [n_bunches][n_scoring]
-    double    total_cpu_time_; // accumulated wall/CPU time over all bunches [s]
+    int       n_completed;     // bunches scored so far (all jobs combined)
+    // Sufficient statistics for combining parallel jobs (all [n_scoring]):
+    double   *sum_ratio;       // Σ (K_tot_b / K_pri_b) over valid bunches
+    double   *sum_ratio2;      // Σ (K_tot_b / K_pri_b)² over valid bunches
+    double   *sum_Kt;          // Σ K_tot_b
+    double   *sum_Kp;          // Σ K_pri_b
+    int      *n_valid_b;       // # bunches with K_pri_b > 0
+    double    total_cpu_time_; // accumulated CPU time over all bunches [s]
 
 
     /*------------------------------------------------------------------------
@@ -582,12 +594,12 @@ int EGS_ShieldApplication::initScoring() {
     options->getInput("photons per bunch", npb);
     n_per_bunch = (long long)npb;
 
-    K_bunch  = new double*[n_bunches];
-    Kp_bunch = new double*[n_bunches];
-    for (int b = 0; b < n_bunches; b++) {
-        K_bunch[b]  = new double[n_scoring]();
-        Kp_bunch[b] = new double[n_scoring]();
-    }
+    sum_ratio  = new double[n_scoring]();
+    sum_ratio2 = new double[n_scoring]();
+    sum_Kt     = new double[n_scoring]();
+    sum_Kp     = new double[n_scoring]();
+    n_valid_b  = new int[n_scoring]();
+    n_completed = 0;
 
     // Enable ausgab calls needed for latch bookkeeping.
     // By default the framework only enables BeforeTransport..AfterTransport.
@@ -629,17 +641,68 @@ void EGS_ShieldApplication::replayContainer(TmpPhsp *src) {
 
 
 /*----------------------------------------------------------------------------
+  initRunControl — force EGS_UniformRunControl (URCO) for parallel runs.
+
+  egs_shield distributes bunches among jobs itself and needs no JCF lock
+  file.  If the framework created a JCF (the default when "rco type" is
+  absent from the run control input block), swap it out for URCO.
+
+  Preferred usage: add "rco type = uniform" (plus timeout settings) to the
+  run control input block so URCO is created with correct configuration.
+  This override is a safety net for egsinp files that omit that key.
+----------------------------------------------------------------------------*/
+int EGS_ShieldApplication::initRunControl() {
+    int err = EGS_AdvancedApplication::initRunControl();
+    if (err) return err;
+    if (dynamic_cast<EGS_JCFControl *>(run)) {
+        EGS_I64 nc = run->getNcase();
+        delete run;
+        run = new EGS_UniformRunControl(this);
+        run->setNcase(nc);
+        egsInformation("egs_shield: replaced JCF with URCO "
+                       "(add 'rco type = uniform' to run control block "
+                       "to configure watcher timeout)\n");
+    }
+    return 0;
+}
+
+
+/*----------------------------------------------------------------------------
   runSimulation — staged + iterative backscatter-aware loop.
 
   APP_MAIN calls finishSimulation() which calls outputResults() after we
   return, so we do NOT call outputResults() here.
 ----------------------------------------------------------------------------*/
 int EGS_ShieldApplication::runSimulation() {
+    // Let the RCO do its startup work (deletes stale .egsdat, handles
+    // resume/combine/analyze modes).  Without this, stale .egsdat files
+    // from a previous parallel run are counted as done by URCO's watcher.
+    int start_err = run->startSimulation();
+    if (start_err != 0) {
+        if (start_err < 0) {
+            egsWarning("egs_shield: run control start failed (%d)\n", start_err);
+        }
+        return 0;   // combine/analyze mode: nothing to simulate
+    }
+
+    // In a parallel run (getNparallel() > 0, getIparallel() > 0), divide
+    // n_bunches evenly across jobs so total work equals a serial run.
+    // Each job uses a different RNG sequence (set by the parallel framework),
+    // so bunches from different jobs are independent and can be combined.
+    int my_n_bunches = n_bunches;
+    if (getNparallel() > 0 && getIparallel() > 0) {
+        int np = getNparallel();
+        int ip = getIparallel() - getFirstParallel();  // 0-based
+        my_n_bunches = n_bunches / np + (ip < n_bunches % np ? 1 : 0);
+        egsInformation("egs_shield: parallel job %d/%d — running %d of %d bunches\n",
+                       getIparallel(), np, my_n_bunches, n_bunches);
+    }
+
     EGS_Timer timer;
-    for (current_bunch = 0; current_bunch < n_bunches; current_bunch++) {
+    for (current_bunch = 0; current_bunch < my_n_bunches; current_bunch++) {
         timer.start();
         egsInformation("egs_shield: bunch %d / %d  (%lld photons)",
-                       current_bunch + 1, n_bunches, n_per_bunch);
+                       current_bunch + 1, my_n_bunches, n_per_bunch);
 
         for (int m = 0; m < n_combing; m++) containers[m]->clean();
 
@@ -732,11 +795,20 @@ int EGS_ShieldApplication::runSimulation() {
 ----------------------------------------------------------------------------*/
 void EGS_ShieldApplication::endBunch() {
     for (int k = 0; k < n_scoring; k++) {
-        K_bunch[current_bunch][k]  = sum_tot[k] / n_per_bunch;
-        Kp_bunch[current_bunch][k] = sum_pri[k] / n_per_bunch;
+        double Kt = sum_tot[k] / n_per_bunch;
+        double Kp = sum_pri[k] / n_per_bunch;
         sum_tot[k] = 0.0;
         sum_pri[k] = 0.0;
+        if (Kp > 0.0) {
+            double ratio   = Kt / Kp;
+            sum_ratio[k]  += ratio;
+            sum_ratio2[k] += ratio * ratio;
+            sum_Kt[k]     += Kt;
+            sum_Kp[k]     += Kp;
+            n_valid_b[k]++;
+        }
     }
+    n_completed++;
 }
 
 
@@ -753,33 +825,17 @@ void EGS_ShieldApplication::outputResults() {
     egsInformation("  %s\n", string(74, '-').c_str());
 
     for (int k = 0; k < n_scoring; k++) {
-        double sum_buf  = 0.0;
-        double sum_buf2 = 0.0;
-        double Kt_mean  = 0.0;
-        double Kp_mean  = 0.0;
-        int    n_valid  = 0;
-
-        for (int b = 0; b < n_bunches; b++) {
-            double Kp = Kp_bunch[b][k];
-            if (Kp <= 0.0) continue;
-            double buf  = K_bunch[b][k] / Kp;
-            sum_buf    += buf;
-            sum_buf2   += buf * buf;
-            Kt_mean    += K_bunch[b][k];
-            Kp_mean    += Kp;
-            n_valid++;
-        }
-
-        if (n_valid < 2) {
+        int nv = n_valid_b[k];
+        if (nv < 2) {
             egsInformation("  %-6d  (insufficient bunches with K_pri > 0)\n", k);
             continue;
         }
 
-        double mean = sum_buf / n_valid;
-        double var  = (sum_buf2 - n_valid * mean * mean) / (n_valid - 1);
-        double sem  = std::sqrt(std::max(var, 0.0) / n_valid);
-        Kt_mean /= n_valid;
-        Kp_mean /= n_valid;
+        double mean    = sum_ratio[k] / nv;
+        double var     = (sum_ratio2[k] - sum_ratio[k] * sum_ratio[k] / nv) / (nv - 1);
+        double sem     = std::sqrt(std::max(var, 0.0) / nv);
+        double Kt_mean = sum_Kt[k] / nv;
+        double Kp_mean = sum_Kp[k] / nv;
 
         double sigma_frac = sem / std::max(mean, 1e-30);
         double fom = (total_cpu_time_ > 0 && sigma_frac > 0)
@@ -792,7 +848,7 @@ void EGS_ShieldApplication::outputResults() {
     }
 
     // ---- Speed and efficiency summary ----
-    long long total_source = (long long)n_bunches * n_per_bunch;
+    long long total_source = (long long)n_completed * n_per_bunch;
     double speed = (total_cpu_time_ > 0)
                    ? total_source / total_cpu_time_ : 0.0;
     egsInformation("\n");
@@ -801,6 +857,119 @@ void EGS_ShieldApplication::outputResults() {
     egsInformation("  FOM = 1/(sigma_BUF^2 * T);  higher is better."
                    "  Expect ~constant with depth for this algorithm.\n");
     egsInformation("\n");
+}
+
+
+/*----------------------------------------------------------------------------
+  finishSimulation — write .egsdat for URCO parallel combining.
+
+  egs_shield's runSimulation() bypasses the standard batch loop and never
+  calls finishBatch(), so outputData() is not invoked automatically.
+  For URCO parallel runs, each non-watcher job must write its own .egsdat
+  so the watcher job can combine results.
+
+  The watcher (last job by URCO convention) is handled by
+  EGS_AdvancedApplication, which calls combineResults() when
+  run->finishSimulation() returns 1.
+
+  JCF fallback (err < 0): if the filesystem doesn't support file locking,
+  JCFControl returns -2.  We recover manually — same logic as before.
+----------------------------------------------------------------------------*/
+int EGS_ShieldApplication::finishSimulation() {
+    int np = getNparallel();
+    int ip = getIparallel();
+    int err = EGS_AdvancedApplication::finishSimulation();
+
+    // egs_shield's runSimulation() bypasses the standard batch loop (which
+    // normally calls finishBatch() → outputData() after each batch).  For
+    // URCO parallel runs we must write the .egsdat explicitly so the watcher
+    // can combine results.
+    //
+    // The watcher is the last parallel job by URCO convention.  It is handled
+    // by EGS_AdvancedApplication (calls combineResults()).  Non-watcher jobs
+    // need outputData() called here.
+    if (err == 0 && np > 0 && ip > 0) {
+        bool is_watcher = (ip == getFirstParallel() + np - 1);
+        if (!is_watcher) {
+            int out_err = outputData();
+            if (out_err)
+                egsWarning("egs_shield: outputData() failed (%d)\n", out_err);
+        }
+    }
+    // Fallback: if JCF failed (err < 0), force the correct path manually.
+    else if (err < 0 && np > 0) {
+        if (ip > 0) {
+            outputResults();
+            err = outputData();
+        } else {
+            combineResults();
+            err = 0;
+        }
+    }
+    return err;
+}
+
+
+/*----------------------------------------------------------------------------
+  Parallel combining: outputData / readData / addState / resetCounter
+
+  After each parallel job completes, the framework writes a .egsdat file via
+  outputData().  combineResults() then resets the accumulator and calls
+  addState() once per job file.  Only the sufficient statistics are needed:
+  sum_ratio[k], sum_ratio2[k], sum_Kt[k], sum_Kp[k], n_valid_b[k], n_completed.
+----------------------------------------------------------------------------*/
+int EGS_ShieldApplication::outputData() {
+    int err = EGS_AdvancedApplication::outputData();
+    if (err) return err;
+    (*data_out) << n_completed << endl << total_cpu_time_ << endl;
+    for (int k = 0; k < n_scoring; k++)
+        (*data_out) << sum_ratio[k]  << " " << sum_ratio2[k] << " "
+                    << sum_Kt[k]     << " " << sum_Kp[k]     << " "
+                    << n_valid_b[k]  << endl;
+    return (*data_out) ? 0 : 99;
+}
+
+int EGS_ShieldApplication::readData() {
+    int err = EGS_AdvancedApplication::readData();
+    if (err) return err;
+    (*data_in) >> n_completed >> total_cpu_time_;
+    for (int k = 0; k < n_scoring; k++)
+        (*data_in) >> sum_ratio[k]  >> sum_ratio2[k]
+                   >> sum_Kt[k]     >> sum_Kp[k]
+                   >> n_valid_b[k];
+    return (*data_in) ? 0 : 99;
+}
+
+int EGS_ShieldApplication::addState(istream &data) {
+    int err = EGS_AdvancedApplication::addState(data);
+    if (err) return err;
+    int    nc; double tcpu;
+    data >> nc >> tcpu;
+    n_completed     += nc;
+    total_cpu_time_ += tcpu;
+    for (int k = 0; k < n_scoring; k++) {
+        double sr, sr2, skt, skp; int nv;
+        data >> sr >> sr2 >> skt >> skp >> nv;
+        sum_ratio[k]  += sr;
+        sum_ratio2[k] += sr2;
+        sum_Kt[k]     += skt;
+        sum_Kp[k]     += skp;
+        n_valid_b[k]  += nv;
+    }
+    return data ? 0 : 99;
+}
+
+void EGS_ShieldApplication::resetCounter() {
+    EGS_AdvancedApplication::resetCounter();
+    n_completed     = 0;
+    total_cpu_time_ = 0.0;
+    for (int k = 0; k < n_scoring; k++) {
+        sum_ratio[k]  = 0.0;
+        sum_ratio2[k] = 0.0;
+        sum_Kt[k]     = 0.0;
+        sum_Kp[k]     = 0.0;
+        n_valid_b[k]  = 0;
+    }
 }
 
 
@@ -827,14 +996,11 @@ EGS_ShieldApplication::~EGS_ShieldApplication() {
         for (int m = 0; m < n_combing; m++) delete snapshots[m];
         delete [] snapshots;
     }
-    if (K_bunch) {
-        for (int b = 0; b < n_bunches; b++) delete [] K_bunch[b];
-        delete [] K_bunch;
-    }
-    if (Kp_bunch) {
-        for (int b = 0; b < n_bunches; b++) delete [] Kp_bunch[b];
-        delete [] Kp_bunch;
-    }
+    delete [] sum_ratio;
+    delete [] sum_ratio2;
+    delete [] sum_Kt;
+    delete [] sum_Kp;
+    delete [] n_valid_b;
 }
 
 

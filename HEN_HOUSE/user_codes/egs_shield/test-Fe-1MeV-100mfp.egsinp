@@ -1,0 +1,314 @@
+##############################################################################
+#
+# egs_shield deep-penetration BUF: 1 MeV photons in iron sphere, to 100 mfp.
+# 38 scoring shells: fine section (0.5–10 mfp, 0.5-mfp steps, 20 shells) +
+#                    coarse section (15–100 mfp, 5-mfp steps, 18 shells).
+# 9 independent combing iron shells at 12.5, 22.5, ..., 92.5 mfp (10 mfp spacing),
+# placed BETWEEN scoring shell positions (not coinciding with them).
+#
+# Stage layout (each stage covers 2 coarse shells):
+#   Stage 0 FD: scores fine shells 0.5–10 mfp; stops at combing shell 0 (12.5 mfp).
+#   Stage 1 FD (replay from 12.5 mfp): scores 15 + 20 mfp; stops at combing 1.
+#   Stage 2 FD (replay from 22.5 mfp): scores 25 + 30 mfp; stops at combing 2.
+#   Stage 3 FD (replay from 32.5 mfp): scores 35 + 40 mfp; stops at combing 3.
+#   Stage 4 FD (replay from 42.5 mfp): scores 45 + 50 mfp; stops at combing 4.
+#   Stage 5 FD (replay from 52.5 mfp): scores 55 + 60 mfp; stops at combing 5.
+#   Stage 6 FD (replay from 62.5 mfp): scores 65 + 70 mfp; stops at combing 6.
+#   Stage 7 FD (replay from 72.5 mfp): scores 75 + 80 mfp; stops at combing 7.
+#   Stage 8 FD (replay from 82.5 mfp): scores 85 + 90 mfp; stops at combing 8.
+#   Stage 9 FD (replay from 92.5 mfp): scores 95 + 100 mfp; exits geometry.
+#   Backscatter loop convergence ∝ exp(−10) ≈ 4.5×10⁻⁵ per iteration → ~6 iters.
+#
+# MFP in iron at 1 MeV ≈ 2.12007 cm (density 7.874 g/cm³, NIST XCOM).
+#
+# Region layout (0-based C++ indices):
+#   Fine section — 40 regions (same as 10/20/30 mfp inputs):
+#    0: iron core (0 → 1.059985 cm)
+#    1: air   0.5 mfp [scoring  0]
+#    ...
+#   38: iron
+#   39: air  10.0 mfp [scoring 19]
+#
+#   Coarse section — 9 groups of 6 regions each (groups separated by comments):
+#   Group 1  (10–20 mfp, combing at ~12.5 mfp):
+#   40: iron  (21.200750 → 26.500000 cm)
+#   41: iron  (26.500000 → 26.501000 cm)  ← combing 0  (~12.5 mfp)
+#   42: iron  (26.501000 → 31.801000 cm)
+#   43: air   15.0 mfp [scoring 20]
+#   44: iron  (31.801100 → 42.401350 cm)
+#   45: air   20.0 mfp [scoring 21]
+#
+#   Group 2  (20–30 mfp, combing at ~22.5 mfp):
+#   46: iron  (42.401450 → 47.700000 cm)
+#   47: iron  (47.700000 → 47.701000 cm)  ← combing 1  (~22.5 mfp)
+#   48: iron  (47.701000 → 53.001700 cm)
+#   49: air   25.0 mfp [scoring 22]
+#   50: iron  (53.001800 → 63.602050 cm)
+#   51: air   30.0 mfp [scoring 23]
+#
+#   Group 3  (30–40 mfp, combing at ~32.5 mfp):
+#   52: iron  (63.602150 → 68.902225 cm)
+#   53: iron  (68.902225 → 68.903225 cm)  ← combing 2  (~32.5 mfp)
+#   54: iron  (68.903225 → 74.202400 cm)
+#   55: air   35.0 mfp [scoring 24]
+#   56: iron  (74.202500 → 84.802750 cm)
+#   57: air   40.0 mfp [scoring 25]
+#
+#   Group 4  (40–50 mfp, combing at ~42.5 mfp):
+#   58: iron  (84.802850 → 90.102925 cm)
+#   59: iron  (90.102925 → 90.103925 cm)  ← combing 3  (~42.5 mfp)
+#   60: iron  (90.103925 → 95.403100 cm)
+#   61: air   45.0 mfp [scoring 26]
+#   62: iron  (95.403200 → 106.003450 cm)
+#   63: air   50.0 mfp [scoring 27]
+#
+#   Group 5  (50–60 mfp, combing at ~52.5 mfp):
+#   64: iron  (106.003550 → 111.303625 cm)
+#   65: iron  (111.303625 → 111.304625 cm) ← combing 4  (~52.5 mfp)
+#   66: iron  (111.304625 → 116.603800 cm)
+#   67: air   55.0 mfp [scoring 28]
+#   68: iron  (116.603900 → 127.204150 cm)
+#   69: air   60.0 mfp [scoring 29]
+#
+#   Group 6  (60–70 mfp, combing at ~62.5 mfp):
+#   70: iron  (127.204250 → 132.504325 cm)
+#   71: iron  (132.504325 → 132.505325 cm) ← combing 5  (~62.5 mfp)
+#   72: iron  (132.505325 → 137.804500 cm)
+#   73: air   65.0 mfp [scoring 30]
+#   74: iron  (137.804600 → 148.404850 cm)
+#   75: air   70.0 mfp [scoring 31]
+#
+#   Group 7  (70–80 mfp, combing at ~72.5 mfp):
+#   76: iron  (148.404950 → 153.705025 cm)
+#   77: iron  (153.705025 → 153.706025 cm) ← combing 6  (~72.5 mfp)
+#   78: iron  (153.706025 → 159.005200 cm)
+#   79: air   75.0 mfp [scoring 32]
+#   80: iron  (159.005300 → 169.605550 cm)
+#   81: air   80.0 mfp [scoring 33]
+#
+#   Group 8  (80–90 mfp, combing at ~82.5 mfp):
+#   82: iron  (169.605650 → 174.905725 cm)
+#   83: iron  (174.905725 → 174.906725 cm) ← combing 7  (~82.5 mfp)
+#   84: iron  (174.906725 → 180.205900 cm)
+#   85: air   85.0 mfp [scoring 34]
+#   86: iron  (180.206000 → 190.806250 cm)
+#   87: air   90.0 mfp [scoring 35]
+#
+#   Group 9  (90–100 mfp, combing at ~92.5 mfp):
+#   88: iron  (190.806350 → 196.106425 cm)
+#   89: iron  (196.106425 → 196.107425 cm) ← combing 8  (~92.5 mfp)
+#   90: iron  (196.107425 → 201.406600 cm)
+#   91: air   95.0 mfp [scoring 36]
+#   92: iron  (201.406700 → 212.006950 cm)
+#   93: air  100.0 mfp [scoring 37]
+#
+#   94: iron  (212.007050 → 233.2077 cm)   outer absorber (~110 mfp)
+#
+# Shell volumes V = 4π × r_inner² × 0.0001 cm  (100 μm thick air shells).
+# Combing shells are 0.001 cm thick iron — negligible attenuation.
+#
+# Reference (egs_kerma IS strip, 132.8×10⁹ histories):
+#   BUF values at 5 mfp: 6.999 (0.000%), 10 mfp: 16.71 (0.002%),
+#   15 mfp: 29.65 (0.048%), 50 mfp: ~152 (~4%), 100 mfp: 281.2 (~6%)
+#
+##############################################################################
+
+:start run control:
+    ncase = 2e8
+    nbatch = 1
+    rco type = uniform
+    interval wait time  = 60000    # 60 s between checks
+    number of intervals = 180      # up to 3 hours wait
+:stop run control:
+
+##############################################################################
+### Geometry
+##############################################################################
+:start geometry definition:
+
+    :start geometry:
+        name    = iron_sphere
+        library = egs_spheres
+        radii   = \
+            1.059985   1.060085  \
+            2.120020   2.120120  \
+            3.180055   3.180155  \
+            4.240090   4.240190  \
+            5.300125   5.300225  \
+            6.360160   6.360260  \
+            7.420195   7.420295  \
+            8.480230   8.480330  \
+            9.540265   9.540365  \
+           10.600300  10.600400  \
+           11.660335  11.660435  \
+           12.720370  12.720470  \
+           13.780405  13.780505  \
+           14.840440  14.840540  \
+           15.900475  15.900575  \
+           16.960510  16.960610  \
+           18.020545  18.020645  \
+           19.080580  19.080680  \
+           20.140615  20.140715  \
+           21.200650  21.200750  \
+           26.500000  26.501000  31.801000  31.801100  42.401350  42.401450  \
+           47.700000  47.701000  53.001700  53.001800  63.602050  63.602150  \
+           68.902225  68.903225  74.202400  74.202500  84.802750  84.802850  \
+           90.102925  90.103925  95.403100  95.403200 106.003450 106.003550  \
+          111.303625 111.304625 116.603800 116.603900 127.204150 127.204250  \
+          132.504325 132.505325 137.804500 137.804600 148.404850 148.404950  \
+          153.705025 153.706025 159.005200 159.005300 169.605550 169.605650  \
+          174.905725 174.906725 180.205900 180.206000 190.806250 190.806350  \
+          196.106425 196.107425 201.406600 201.406700 212.006950 212.007050  \
+          233.207700
+
+        :start media input:
+            media = iron air
+            # Fine section air shells (0.5–10 mfp)
+            set medium =  1 1
+            set medium =  3 1
+            set medium =  5 1
+            set medium =  7 1
+            set medium =  9 1
+            set medium = 11 1
+            set medium = 13 1
+            set medium = 15 1
+            set medium = 17 1
+            set medium = 19 1
+            set medium = 21 1
+            set medium = 23 1
+            set medium = 25 1
+            set medium = 27 1
+            set medium = 29 1
+            set medium = 31 1
+            set medium = 33 1
+            set medium = 35 1
+            set medium = 37 1
+            set medium = 39 1
+            # Coarse section air shells (15–100 mfp)
+            set medium = 43 1
+            set medium = 45 1
+            set medium = 49 1
+            set medium = 51 1
+            set medium = 55 1
+            set medium = 57 1
+            set medium = 61 1
+            set medium = 63 1
+            set medium = 67 1
+            set medium = 69 1
+            set medium = 73 1
+            set medium = 75 1
+            set medium = 79 1
+            set medium = 81 1
+            set medium = 85 1
+            set medium = 87 1
+            set medium = 91 1
+            set medium = 93 1
+        :stop media input:
+    :stop geometry:
+
+    simulation geometry = iron_sphere
+
+:stop geometry definition:
+
+##############################################################################
+### Media
+##############################################################################
+:start media definition:
+
+    ae = 0.521
+    ue = 2.511
+    ap = 0.010
+    up = 2.0
+
+    :start iron:
+        density correction file = iron
+    :stop iron:
+
+    :start air:
+        density correction file = air_dry_nearsealevel
+    :stop air:
+
+:stop media definition:
+
+##############################################################################
+### Source — isotropic point source at origin
+##############################################################################
+:start source definition:
+
+    :start source:
+        name      = point_source
+        library   = egs_isotropic_source
+        charge    = 0
+        :start spectrum:
+            type   = monoenergetic
+            energy = 1
+        :stop spectrum:
+        :start shape:
+            type     = point
+            position = 0 0 0
+        :stop shape:
+    :stop source:
+
+    simulation source = point_source
+
+:stop source definition:
+
+:start rng definition:
+    type = xoshiro256++
+    initial seeds = 13579 24680
+:stop rng definition:
+
+##############################################################################
+### Scoring options
+##############################################################################
+:start scoring options:
+
+    geometry name = iron_sphere
+
+    # 38 scoring shells: 20 fine (0.5–10 mfp) + 18 coarse (15–100 mfp)
+    scoring regions = \
+         1  3  5  7  9  11 13 15 17 19 \
+        21 23 25 27 29  31 33 35 37 39 \
+        43 45 49 51 55  57 61 63 67 69 \
+        73 75 79 81 85  87 91 93
+
+    # V = 4π × r_inner² × 0.0001 cm³  (100 μm thick air shells)
+    scoring volumes = \
+        1.412E-03  5.648E-03  1.271E-02  2.259E-02  3.530E-02 \
+        5.083E-02  6.919E-02  9.037E-02  1.144E-01  1.412E-01 \
+        1.709E-01  2.033E-01  2.386E-01  2.768E-01  3.177E-01 \
+        3.615E-01  4.081E-01  4.575E-01  5.097E-01  5.648E-01 \
+        1.2708E+00 2.2593E+00 3.5304E+00 5.0846E+00 6.9186E+00 \
+        9.0367E+00 1.1437E+01 1.4121E+01 1.7086E+01 2.0334E+01 \
+        2.3864E+01 2.7676E+01 3.1772E+01 3.6149E+01 4.0808E+01 \
+        4.5750E+01 5.0975E+01 5.6482E+01
+
+    # 9 combing shells at ~12.5, 22.5, ..., 92.5 mfp (10 mfp spacing).
+    # Each combing shell is a 0.001 cm thin iron region placed halfway through
+    # the iron between consecutive scoring positions.
+    combing regions = 41 47 53 59 65 71 77 83 89
+
+    emuen file = $EGS_HOME/egs_kerma/emuen_rho_air_1keV-20MeV.data
+
+    n bunches         = 200
+    photons per bunch = 1000000
+
+:stop scoring options:
+
+:start variance reduction:
+:stop variance reduction:
+
+:start MC transport parameter:
+    Global ECUT                  = 0.521
+    Global PCUT                  = 0.010
+    Rayleigh scattering          = On
+    Photoelectron angular sampling = Off
+    Brems angular sampling       = Simple
+    Bound Compton scattering     = norej
+    Pair angular sampling        = Off
+    ESTEPE                       = 0.25
+    XIMAX                        = 0.5
+    Skin depth for BCA           = 3
+    Boundary crossing algorithm  = EXACT
+    Electron-step algorithm      = PRESTA-II
+:stop MC transport parameter:
