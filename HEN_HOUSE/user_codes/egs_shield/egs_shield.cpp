@@ -786,6 +786,34 @@ int EGS_ShieldApplication::runSimulation() {
         endBunch();
         egsInformation("  %.1f s\n", bunch_time);
     }
+
+    // We replace the standard batch loop, so EGS_RunControl::finishBatch() is
+    // never reached.  Call it once here, at the point the batch loop would
+    // have, to do the end-of-batch bookkeeping: it sets the run control's
+    // cpu_time and then calls outputData() for us.  Doing this for EVERY
+    // parallel job -- the watcher included -- is what gets every job's results
+    // into the combine.
+    //
+    // It must happen here and not in finishSimulation(): for the watcher the
+    // whole combine runs inside EGS_AdvancedApplication::finishSimulation(),
+    // and the partial combine inside URCO's poll loop calls resetCounter(),
+    // which zeroes our accumulators.  Writing afterwards would store zeros
+    // into a file nothing reads any more.
+    //
+    // run_dir is still set at this point, so the file lands in this job's
+    // egsrun_* directory: invisible to howManyJobsDone() (which scans the
+    // application directory only), so the watcher's poll loop still waits for
+    // npar-1 *other* jobs.  finishRun() then moves it up to the application
+    // directory before combineResults() runs.
+    //
+    // finishBatch() also prints a batch summary line and applies the
+    // "statistical accuracy sought" early-termination test.  We do not
+    // override getCurrentResult(), so that line's result/uncertainty columns
+    // print as 0 and 100.00; the return value is only meaningful for loop
+    // control, which we do not have, so it is discarded.
+    if (getNparallel() > 0 && getIparallel() > 0) {
+        run->finishBatch();
+    }
     return 0;
 }
 
@@ -861,12 +889,11 @@ void EGS_ShieldApplication::outputResults() {
 
 
 /*----------------------------------------------------------------------------
-  finishSimulation — write .egsdat for URCO parallel combining.
+  finishSimulation
 
-  egs_shield's runSimulation() bypasses the standard batch loop and never
-  calls finishBatch(), so outputData() is not invoked automatically.
-  For URCO parallel runs, each non-watcher job must write its own .egsdat
-  so the watcher job can combine results.
+  The .egsdat needed for URCO parallel combining is written at the end of
+  runSimulation() (see the comment there) — every job writes one, including
+  the watcher, so every job's results reach the combine.
 
   The watcher (last job by URCO convention) is handled by
   EGS_AdvancedApplication, which calls combineResults() when
@@ -880,24 +907,8 @@ int EGS_ShieldApplication::finishSimulation() {
     int ip = getIparallel();
     int err = EGS_AdvancedApplication::finishSimulation();
 
-    // egs_shield's runSimulation() bypasses the standard batch loop (which
-    // normally calls finishBatch() → outputData() after each batch).  For
-    // URCO parallel runs we must write the .egsdat explicitly so the watcher
-    // can combine results.
-    //
-    // The watcher is the last parallel job by URCO convention.  It is handled
-    // by EGS_AdvancedApplication (calls combineResults()).  Non-watcher jobs
-    // need outputData() called here.
-    if (err == 0 && np > 0 && ip > 0) {
-        bool is_watcher = (ip == getFirstParallel() + np - 1);
-        if (!is_watcher) {
-            int out_err = outputData();
-            if (out_err)
-                egsWarning("egs_shield: outputData() failed (%d)\n", out_err);
-        }
-    }
     // Fallback: if JCF failed (err < 0), force the correct path manually.
-    else if (err < 0 && np > 0) {
+    if (err < 0 && np > 0) {
         if (ip > 0) {
             outputResults();
             err = outputData();
