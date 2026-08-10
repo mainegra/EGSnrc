@@ -206,7 +206,8 @@ public:
           n_bunches(100), n_per_bunch(1000000LL),
           current_bunch(0), n_completed(0),
           sum_ratio(nullptr), sum_ratio2(nullptr),
-          sum_Kt(nullptr), sum_Kp(nullptr), n_valid_b(nullptr),
+          sum_Kt(nullptr), sum_Kp(nullptr), sum_Kp0(nullptr),
+          n_valid_b(nullptr),
           total_cpu_time_(0.0)
     {}
 
@@ -303,6 +304,7 @@ private:
     // while BUF was unaffected (same wrong denominator in numerator/denominator).
     vector<double> sum_tot;
     vector<double> sum_pri;
+    vector<double> sum_pri0;   // as sum_pri but with the exp(-Λ) factor omitted
 
     // ---- E*mu_en/rho interpolator (log E abscissa) ----
     EGS_Interpolator *E_Muen_Rho;
@@ -317,6 +319,9 @@ private:
     double   *sum_ratio2;      // Σ (K_tot_b / K_pri_b)² over valid bunches
     double   *sum_Kt;          // Σ K_tot_b
     double   *sum_Kp;          // Σ K_pri_b
+    double   *sum_Kp0;         // Σ K_pri_b computed with exp(-Λ) omitted;
+                               // K_pri/K_pri0 is the primary transmission, so
+                               // η_eff = -ln(ΣK_pri / ΣK_pri0).  See outputResults().
     int      *n_valid_b;       // # bunches with K_pri_b > 0
     double    total_cpu_time_; // accumulated CPU time over all bunches [s]
 
@@ -419,10 +424,18 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
 
             if (t_shell < TSTEP_MAX) {
                 EGS_Float emuen_rho = E_Muen_Rho->interpolateFast(gle);
-                EGS_Float score = wt * std::exp(-Lambda) * emuen_rho
-                                  * t_shell / V_shell[k];
+                EGS_Float unatt = wt * emuen_rho * t_shell / V_shell[k];
+                EGS_Float score = unatt * std::exp(-Lambda);
                 sum_tot[k] += score;               // total = primary + scattered
-                if (is_primary) sum_pri[k] += score;
+                if (is_primary) {
+                    sum_pri[k]  += score;
+                    // Same score with the attenuation factor removed.  The
+                    // ratio of the two sums is the primary transmission along
+                    // the FD rays, from which outputResults() recovers the
+                    // effective optical depth.  Costs one multiply-add per
+                    // primary FD score.
+                    sum_pri0[k] += unatt;
+                }
             }
 
             // Traverse the scoring shell (air attenuation negligible, no Lambda update).
@@ -576,6 +589,7 @@ int EGS_ShieldApplication::initScoring() {
     // ---- Kerma accumulators ----
     sum_tot.assign(n_scoring, 0.0);
     sum_pri.assign(n_scoring, 0.0);
+    sum_pri0.assign(n_scoring, 0.0);
 
     // ---- Containers and snapshot buffers ----
     containers = new TmpPhsp*[n_combing];
@@ -598,6 +612,7 @@ int EGS_ShieldApplication::initScoring() {
     sum_ratio2 = new double[n_scoring]();
     sum_Kt     = new double[n_scoring]();
     sum_Kp     = new double[n_scoring]();
+    sum_Kp0    = new double[n_scoring]();
     n_valid_b  = new int[n_scoring]();
     n_completed = 0;
 
@@ -760,13 +775,49 @@ int EGS_ShieldApplication::runSimulation() {
             for (int j = 0; j < containers[m]->size(); j++)
                 w_initial += (*containers[m])[j].wt;
 
+        // Cascade diagnostic (first bunch only, so cost and log noise are
+        // negligible).  Prints, per replay iteration, the surviving weight
+        // relative to w_initial and the occupancy of every combing container.
+        // Its purpose is to show how deep the cascade actually propagates:
+        // a scoring shell beyond combing shell m can only be scored once
+        // container m has been replayed, so a container that never fills is
+        // a scoring hole, not merely a slow tail.
+        const bool diag = (current_bunch == 0);
+        if (diag) {
+            egsInformation("\n  [cascade] bunch 0, %d combing shells, "
+                           "w_initial = %.6g\n", n_combing, w_initial);
+            egsInformation("  [cascade] %4s %12s %12s   %s\n",
+                           "iter", "w_cur", "w_cur/w_ini", "container sizes");
+        }
+
         static const int MAX_ITER = 500;
         for (int iter = 0; iter < MAX_ITER; iter++) {
             double w_cur = 0;
             for (int m = 0; m < n_combing; m++)
                 for (int j = 0; j < containers[m]->size(); j++)
                     w_cur += (*containers[m])[j].wt;
-            if (w_cur <= 0 || w_cur < 1e-10 * w_initial) break;
+
+            if (diag) {
+                string occ;
+                char b[32];
+                for (int m = 0; m < n_combing; m++) {
+                    sprintf(b, "%d", containers[m]->size());
+                    occ += b;
+                    if (m + 1 < n_combing) occ += " ";
+                }
+                egsInformation("  [cascade] %4d %12.4g %12.3g   %s\n",
+                               iter, w_cur,
+                               w_initial > 0 ? w_cur / w_initial : 0.0,
+                               occ.c_str());
+            }
+
+            if (w_cur <= 0 || w_cur < 1e-10 * w_initial) {
+                if (diag)
+                    egsInformation("  [cascade] STOP at iter %d: w_cur/w_ini = %.3g"
+                                   " < 1e-10 threshold\n\n", iter,
+                                   w_initial > 0 ? w_cur / w_initial : 0.0);
+                break;
+            }
 
             for (int m = 0; m < n_combing; m++) {
                 std::swap(containers[m], snapshots[m]);
@@ -823,16 +874,19 @@ int EGS_ShieldApplication::runSimulation() {
 ----------------------------------------------------------------------------*/
 void EGS_ShieldApplication::endBunch() {
     for (int k = 0; k < n_scoring; k++) {
-        double Kt = sum_tot[k] / n_per_bunch;
-        double Kp = sum_pri[k] / n_per_bunch;
-        sum_tot[k] = 0.0;
-        sum_pri[k] = 0.0;
+        double Kt  = sum_tot[k]  / n_per_bunch;
+        double Kp  = sum_pri[k]  / n_per_bunch;
+        double Kp0 = sum_pri0[k] / n_per_bunch;
+        sum_tot[k]  = 0.0;
+        sum_pri[k]  = 0.0;
+        sum_pri0[k] = 0.0;
         if (Kp > 0.0) {
             double ratio   = Kt / Kp;
             sum_ratio[k]  += ratio;
             sum_ratio2[k] += ratio * ratio;
             sum_Kt[k]     += Kt;
             sum_Kp[k]     += Kp;
+            sum_Kp0[k]    += Kp0;
             n_valid_b[k]++;
         }
     }
@@ -842,20 +896,73 @@ void EGS_ShieldApplication::endBunch() {
 
 /*----------------------------------------------------------------------------
   outputResults
+
+  Effective optical depth (eta/mfp column)
+  ---------------------------------------
+  The FD estimator already carries the exact quantity we want.  Every primary
+  score is w·exp(-Λ)·(E μen/ρ)·t/V, where Λ is the optical depth accumulated
+  along the ray from the source to the shell.  Accumulating the same score
+  without exp(-Λ) (sum_Kp0) makes the ratio ΣK_pri/ΣK_pri0 the primary
+  transmission, so
+
+      η_eff = -ln( ΣK_pri / ΣK_pri0 )
+
+  For a monoenergetic point source and concentric shells every primary ray to
+  a given shell is identical, so η_eff is exactly that shell's optical depth,
+  to machine precision and with no user input.
+
+  For a polyenergetic source the per-photon η varies with energy and η_eff
+  becomes -ln⟨exp(-η)⟩, the transmission-weighted mean — which is the right
+  characteristic depth here, because it is precisely the attenuation that
+  forms the denominator of the buildup factor.  It is not the arithmetic mean
+  optical depth, and for a broad spectrum it will sit below it (low-energy
+  components are attenuated away and stop contributing).  The same expression
+  also handles extended or off-axis sources, where different primaries reach a
+  shell along different chords.  Deriving it beats an input-supplied mfp,
+  which would additionally assume a spherical geometry and a source at the
+  centre.
 ----------------------------------------------------------------------------*/
 void EGS_ShieldApplication::outputResults() {
     static const double MeVtoGy = 1.6021773e-10;
 
+    // Warn when the reported result is not the requested one.  Fires on serial
+    // runs and on the final parallel combine (i_parallel reset to 0 before
+    // combineResults()), but not on an individual job's own log, where
+    // n_completed is only that job's share of the bunches.
+    bool is_single_job = (getNparallel() > 0 && getIparallel() > 0);
+    if (!is_single_job && n_completed != n_bunches) {
+        egsWarning("\n"
+                   "  ****************************************************************\n"
+                   "  *** INCOMPLETE: %d of %d bunches present in this result.\n"
+                   "  *** %d bunch(es) are missing -- %.1f%% of the requested work\n"
+                   "  *** is not included below.\n"
+                   "  *** In a parallel run this normally means the watcher job\n"
+                   "  *** stopped waiting before the other jobs finished.  Raise\n"
+                   "  *** 'number of intervals' and/or 'interval wait time' in the\n"
+                   "  *** run control block and re-combine.\n"
+                   "  ****************************************************************\n",
+                   n_completed, n_bunches, n_bunches - n_completed,
+                   100.0 * (n_bunches - n_completed) / std::max(n_bunches, 1));
+    }
+
     egsInformation("\n");
-    egsInformation("  %-6s  %-14s  %-14s  %-12s  %-10s  %-12s\n",
-                   "Shell", "K_tot/[Gy]", "K_pri/[Gy]", "BUF", "sigma/%",
-                   "FOM/[s^-1]");
-    egsInformation("  %s\n", string(74, '-').c_str());
+    egsInformation("  %-6s  %-9s  %-14s  %-14s  %-12s  %-10s  %-12s\n",
+                   "Region", "eta/mfp", "K_tot/[Gy]", "K_pri/[Gy]", "BUF",
+                   "sigma/%", "FOM/[s^-1]");
+    egsInformation("  %s\n", string(85, '-').c_str());
 
     for (int k = 0; k < n_scoring; k++) {
         int nv = n_valid_b[k];
+
+        // eta is deterministic, so report it even when the statistics are not
+        // yet usable.
+        double eta = (sum_Kp[k] > 0.0 && sum_Kp0[k] > 0.0)
+                     ? -std::log(sum_Kp[k] / sum_Kp0[k]) : 0.0;
+
         if (nv < 2) {
-            egsInformation("  %-6d  (insufficient bunches with K_pri > 0)\n", k);
+            egsInformation("  %-6d  %-9.4f  (%d bunch(es) in this job -- "
+                           "statistics come from the combined run)\n",
+                           scoring_reg[k], eta, nv);
             continue;
         }
 
@@ -870,8 +977,9 @@ void EGS_ShieldApplication::outputResults() {
                      ? 1.0 / (sigma_frac * sigma_frac * total_cpu_time_)
                      : 0.0;
 
-        egsInformation("  %-6d  %-14.6g  %-14.6g  %-12.6g  %-10.4f  %-12.4g\n",
-                       k, Kt_mean * MeVtoGy, Kp_mean * MeVtoGy, mean,
+        egsInformation("  %-6d  %-9.4f  %-14.6g  %-14.6g  %-12.6g  %-10.4f  %-12.4g\n",
+                       scoring_reg[k], eta,
+                       Kt_mean * MeVtoGy, Kp_mean * MeVtoGy, mean,
                        100.0 * sigma_frac, fom);
     }
 
@@ -880,8 +988,11 @@ void EGS_ShieldApplication::outputResults() {
     double speed = (total_cpu_time_ > 0)
                    ? total_source / total_cpu_time_ : 0.0;
     egsInformation("\n");
-    egsInformation("  Source photons: %lld  |  CPU: %.1f s  |  Speed: %.0f photons/s\n",
-                   total_source, total_cpu_time_, speed);
+    egsInformation("  Bunches: %d of %d  |  Source photons: %lld  |  CPU: %.1f s"
+                   "  |  Speed: %.0f photons/s\n",
+                   n_completed, n_bunches, total_source, total_cpu_time_, speed);
+    egsInformation("  eta = -ln(K_pri/K_pri_unattenuated), the transmission-weighted\n"
+                   "  optical depth along the forced-detection rays.\n");
     egsInformation("  FOM = 1/(sigma_BUF^2 * T);  higher is better."
                    "  Expect ~constant with depth for this algorithm.\n");
     egsInformation("\n");
@@ -936,6 +1047,7 @@ int EGS_ShieldApplication::outputData() {
     for (int k = 0; k < n_scoring; k++)
         (*data_out) << sum_ratio[k]  << " " << sum_ratio2[k] << " "
                     << sum_Kt[k]     << " " << sum_Kp[k]     << " "
+                    << sum_Kp0[k]    << " "
                     << n_valid_b[k]  << endl;
     return (*data_out) ? 0 : 99;
 }
@@ -947,6 +1059,7 @@ int EGS_ShieldApplication::readData() {
     for (int k = 0; k < n_scoring; k++)
         (*data_in) >> sum_ratio[k]  >> sum_ratio2[k]
                    >> sum_Kt[k]     >> sum_Kp[k]
+                   >> sum_Kp0[k]
                    >> n_valid_b[k];
     return (*data_in) ? 0 : 99;
 }
@@ -959,12 +1072,13 @@ int EGS_ShieldApplication::addState(istream &data) {
     n_completed     += nc;
     total_cpu_time_ += tcpu;
     for (int k = 0; k < n_scoring; k++) {
-        double sr, sr2, skt, skp; int nv;
-        data >> sr >> sr2 >> skt >> skp >> nv;
+        double sr, sr2, skt, skp, skp0; int nv;
+        data >> sr >> sr2 >> skt >> skp >> skp0 >> nv;
         sum_ratio[k]  += sr;
         sum_ratio2[k] += sr2;
         sum_Kt[k]     += skt;
         sum_Kp[k]     += skp;
+        sum_Kp0[k]    += skp0;
         n_valid_b[k]  += nv;
     }
     return data ? 0 : 99;
@@ -979,6 +1093,7 @@ void EGS_ShieldApplication::resetCounter() {
         sum_ratio2[k] = 0.0;
         sum_Kt[k]     = 0.0;
         sum_Kp[k]     = 0.0;
+        sum_Kp0[k]    = 0.0;
         n_valid_b[k]  = 0;
     }
 }
@@ -1011,6 +1126,7 @@ EGS_ShieldApplication::~EGS_ShieldApplication() {
     delete [] sum_ratio2;
     delete [] sum_Kt;
     delete [] sum_Kp;
+    delete [] sum_Kp0;
     delete [] n_valid_b;
 }
 
