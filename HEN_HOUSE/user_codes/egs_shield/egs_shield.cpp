@@ -268,6 +268,7 @@ public:
     int  outputData()          override;
     int  readData()            override;
     int  addState(istream &d)  override;
+    int  combineResults()      override;
     void resetCounter()        override;
 
 protected:
@@ -847,34 +848,41 @@ int EGS_ShieldApplication::runSimulation() {
         total_cpu_time_ += bunch_time;
         endBunch();
         egsInformation("  %.1f s\n", bunch_time);
-    }
 
-    // We replace the standard batch loop, so EGS_RunControl::finishBatch() is
-    // never reached.  Call it once here, at the point the batch loop would
-    // have, to do the end-of-batch bookkeeping: it sets the run control's
-    // cpu_time and then calls outputData() for us.  Doing this for EVERY
-    // parallel job -- the watcher included -- is what gets every job's results
-    // into the combine.
-    //
-    // It must happen here and not in finishSimulation(): for the watcher the
-    // whole combine runs inside EGS_AdvancedApplication::finishSimulation(),
-    // and the partial combine inside URCO's poll loop calls resetCounter(),
-    // which zeroes our accumulators.  Writing afterwards would store zeros
-    // into a file nothing reads any more.
-    //
-    // run_dir is still set at this point, so the file lands in this job's
-    // egsrun_* directory: invisible to howManyJobsDone() (which scans the
-    // application directory only), so the watcher's poll loop still waits for
-    // npar-1 *other* jobs.  finishRun() then moves it up to the application
-    // directory before combineResults() runs.
-    //
-    // finishBatch() also prints a batch summary line and applies the
-    // "statistical accuracy sought" early-termination test.  We do not
-    // override getCurrentResult(), so that line's result/uncertainty columns
-    // print as 0 and 100.00; the return value is only meaningful for loop
-    // control, which we do not have, so it is discarded.
-    if (getNparallel() > 0 && getIparallel() > 0) {
-        run->finishBatch();
+        // We replace the standard batch loop, so EGS_RunControl::finishBatch()
+        // is never reached.  Call it here, once per bunch, exactly where the
+        // batch loop would: it sets the run control's cpu_time and then calls
+        // outputData() for us.  Doing this for EVERY parallel job -- the
+        // watcher included -- is what gets every job's results into the
+        // combine.
+        //
+        // Per bunch rather than once at the end, so a job that dies partway
+        // through still contributes its completed bunches.  The .egsdat holds
+        // cumulative sums and is simply overwritten, so the newest file always
+        // reflects every bunch finished so far.  This matters on a cluster:
+        // OOM kills land mid-cascade, at peak memory, and previously took every
+        // bunch of that job with them.
+        //
+        // It must happen here and not in finishSimulation(): for the watcher
+        // the whole combine runs inside EGS_AdvancedApplication::
+        // finishSimulation(), and the partial combine inside URCO's poll loop
+        // calls resetCounter(), which zeroes our accumulators.  Writing
+        // afterwards would store zeros into a file nothing reads any more.
+        //
+        // run_dir is still set at this point, so the file lands in this job's
+        // egsrun_* directory: invisible to howManyJobsDone() (which scans the
+        // application directory only), so the watcher's poll loop still waits
+        // for npar-1 *other* jobs.  finishRun() then moves it up to the
+        // application directory before combineResults() runs.
+        //
+        // finishBatch() also prints a batch summary line and applies the
+        // "statistical accuracy sought" early-termination test.  We do not
+        // override getCurrentResult(), so that line's result/uncertainty
+        // columns print as 0 and 100.00; the return value is only meaningful
+        // for loop control, which we do not have, so it is discarded.
+        if (getNparallel() > 0 && getIparallel() > 0) {
+            run->finishBatch();
+        }
     }
     return 0;
 }
@@ -1094,6 +1102,109 @@ int EGS_ShieldApplication::addState(istream &data) {
     }
     return data ? 0 : 99;
 }
+
+/*----------------------------------------------------------------------------
+  combineResults — like the base class, but a bad .egsdat is skipped instead
+  of failing the whole combine.
+
+  EGS_Application::combineResults() returns -1 if any single file fails to
+  parse, and EGS_AdvancedApplication::finishSimulation() bails on that before
+  outputResults() ever runs.  One truncated file therefore costs the entire
+  run's output.  That is a poor trade at 800 jobs, and more likely now that
+  outputData() runs once per bunch: a job killed during a write leaves a short
+  file behind.
+
+  Failed files are rolled back and skipped.  The rollback covers this class's
+  accumulators, which are the only inputs to the reported results; a partial
+  read has already perturbed the base class's run/rndm/source state, which we
+  cannot undo, but that affects only the cosmetic ncase and cpu columns of the
+  listing below, not BUF, K or sigma.
+----------------------------------------------------------------------------*/
+int EGS_ShieldApplication::combineResults() {
+    int np = getNparallel();
+    if (np <= 0) {
+        // No job count given: nothing sensible to iterate over, and the base
+        // class has a fallback for it.
+        return EGS_AdvancedApplication::combineResults();
+    }
+
+    egsInformation(
+        "\n                      Suming the following .egsdat files:\n"
+        "=======================================================================\n");
+    resetCounter();
+
+    // Snapshots for rollback.
+    vector<double> s_ratio(n_scoring), s_ratio2(n_scoring), s_Kt(n_scoring),
+           s_Kp(n_scoring), s_Kp0(n_scoring);
+    vector<int>    s_valid(n_scoring);
+
+    EGS_Float last_cpu = 0;
+    EGS_I64   last_ncase = 0;
+    int ndat = 0, nbad = 0;
+    char buf[512];
+
+    for (int j = getFirstParallel(); j < getFirstParallel() + np; j++) {
+        sprintf(buf, "%s_w%d.egsdat", getFinalOutputFile().c_str(), j);
+        string dfile = egsJoinPath(getAppDir(), buf);
+        ifstream data(dfile.c_str());
+        if (!data) {
+            continue;    // job never ran, or never got far enough to write
+        }
+
+        int    save_completed = n_completed;
+        double save_cpu       = total_cpu_time_;
+        for (int k = 0; k < n_scoring; k++) {
+            s_ratio[k]  = sum_ratio[k];
+            s_ratio2[k] = sum_ratio2[k];
+            s_Kt[k]     = sum_Kt[k];
+            s_Kp[k]     = sum_Kp[k];
+            s_Kp0[k]    = sum_Kp0[k];
+            s_valid[k]  = n_valid_b[k];
+        }
+
+        int err = addState(data);
+        if (err) {
+            n_completed     = save_completed;
+            total_cpu_time_ = save_cpu;
+            for (int k = 0; k < n_scoring; k++) {
+                sum_ratio[k]  = s_ratio[k];
+                sum_ratio2[k] = s_ratio2[k];
+                sum_Kt[k]     = s_Kt[k];
+                sum_Kp[k]     = s_Kp[k];
+                sum_Kp0[k]    = s_Kp0[k];
+                n_valid_b[k]  = s_valid[k];
+            }
+            ++nbad;
+            egsWarning("   %-30s SKIPPED (parse error %d)\n", buf, err);
+            continue;
+        }
+
+        ++ndat;
+        EGS_I64   ncase = run->getNdone();
+        EGS_Float cpu   = run->getCPUTime();
+        egsInformation("%2d %-30s ncase=%-14lld cpu=%-11.2f\n",
+                       ndat, buf, ncase - last_ncase, cpu - last_cpu);
+        last_ncase = ncase;
+        last_cpu   = cpu;
+    }
+
+    if (ndat > 0) {
+        egsInformation(
+            "=======================================================================\n");
+        egsInformation("%40s%-14lld cpu=%-11.2f\n\n", "Total ncase=",
+                       last_ncase, last_cpu);
+    }
+    if (nbad > 0) {
+        egsWarning("\n  *** %d .egsdat file(s) were unreadable and have been "
+                   "skipped.\n"
+                   "  *** Their contribution is absent from the results below;\n"
+                   "  *** the bunch count in the summary line reflects this.\n\n",
+                   nbad);
+    }
+    // Unlike the base class, succeed as long as something was read.
+    return ndat > 0 ? 0 : 1;
+}
+
 
 void EGS_ShieldApplication::resetCounter() {
     EGS_AdvancedApplication::resetCounter();
