@@ -203,6 +203,7 @@ public:
           is_combing(nullptr),
           containers(nullptr), snapshots(nullptr),
           E_Muen_Rho(nullptr),
+          cascade_diag(false),
           n_bunches(100), n_per_bunch(1000000LL),
           current_bunch(0), n_completed(0),
           sum_ratio(nullptr), sum_ratio2(nullptr),
@@ -310,6 +311,7 @@ private:
     EGS_Interpolator *E_Muen_Rho;
 
     // ---- Bunch bookkeeping ----
+    bool      cascade_diag;    // print the replay-cascade trace (input option)
     int       n_bunches;
     long long n_per_bunch;
     int       current_bunch;
@@ -608,6 +610,15 @@ int EGS_ShieldApplication::initScoring() {
     options->getInput("photons per bunch", npb);
     n_per_bunch = (long long)npb;
 
+    // Opt-in replay-cascade trace; off by default.  Useful when adding combing
+    // shells or changing their spacing, to confirm every container is actually
+    // reached before the loop's weight threshold stops it.  Prints ~10 lines
+    // per job, so leave it off for large parallel runs.
+    vector<string> choice;
+    choice.push_back("no");
+    choice.push_back("yes");
+    cascade_diag = options->getInput("cascade diagnostic", choice, 0) ? true : false;
+
     sum_ratio  = new double[n_scoring]();
     sum_ratio2 = new double[n_scoring]();
     sum_Kt     = new double[n_scoring]();
@@ -782,7 +793,7 @@ int EGS_ShieldApplication::runSimulation() {
         // a scoring shell beyond combing shell m can only be scored once
         // container m has been replayed, so a container that never fills is
         // a scoring hole, not merely a slow tail.
-        const bool diag = (current_bunch == 0);
+        const bool diag = cascade_diag && (current_bunch == 0);
         if (diag) {
             egsInformation("\n  [cascade] bunch 0, %d combing shells, "
                            "w_initial = %.6g\n", n_combing, w_initial);
