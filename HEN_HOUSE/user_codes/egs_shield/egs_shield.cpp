@@ -203,11 +203,12 @@ public:
           is_combing(nullptr),
           containers(nullptr), snapshots(nullptr),
           E_Muen_Rho(nullptr),
-          cascade_diag(false),
+          cascade_diag(false), bunch_stats(false),
           n_bunches(100), n_per_bunch(1000000LL),
           current_bunch(0), n_completed(0),
           sum_ratio(nullptr), sum_ratio2(nullptr),
           sum_Kt(nullptr), sum_Kp(nullptr), sum_Kp0(nullptr),
+          max_ratio(nullptr),
           n_valid_b(nullptr),
           total_cpu_time_(0.0)
     {}
@@ -313,6 +314,7 @@ private:
 
     // ---- Bunch bookkeeping ----
     bool      cascade_diag;    // print the replay-cascade trace (input option)
+    bool      bunch_stats;     // print per-shell bunch-contribution stats (input)
     int       n_bunches;
     long long n_per_bunch;
     int       current_bunch;
@@ -322,6 +324,9 @@ private:
     double   *sum_ratio2;      // Σ (K_tot_b / K_pri_b)² over valid bunches
     double   *sum_Kt;          // Σ K_tot_b
     double   *sum_Kp;          // Σ K_pri_b
+    double   *max_ratio;       // largest single-bunch K_tot/K_pri, per shell.
+                               // Not derivable from the other sums; shows how
+                               // much one bunch dominates a shell.
     double   *sum_Kp0;         // Σ K_pri_b computed with exp(-Λ) omitted;
                                // K_pri/K_pri0 is the primary transmission, so
                                // η_eff = -ln(ΣK_pri / ΣK_pri0).  See outputResults().
@@ -620,11 +625,17 @@ int EGS_ShieldApplication::initScoring() {
     choice.push_back("yes");
     cascade_diag = options->getInput("cascade diagnostic", choice, 0) ? true : false;
 
+    // Per-shell bunch-contribution statistics: how concentrated a result is in
+    // a few bunches.  Cheap, off by default; turn on when a deep shell's sigma
+    // looks untrustworthy.
+    bunch_stats  = options->getInput("bunch statistics", choice, 0) ? true : false;
+
     sum_ratio  = new double[n_scoring]();
     sum_ratio2 = new double[n_scoring]();
     sum_Kt     = new double[n_scoring]();
     sum_Kp     = new double[n_scoring]();
     sum_Kp0    = new double[n_scoring]();
+    max_ratio  = new double[n_scoring]();
     n_valid_b  = new int[n_scoring]();
     n_completed = 0;
 
@@ -906,6 +917,7 @@ void EGS_ShieldApplication::endBunch() {
             sum_Kt[k]     += Kt;
             sum_Kp[k]     += Kp;
             sum_Kp0[k]    += Kp0;
+            if (ratio > max_ratio[k]) max_ratio[k] = ratio;
             n_valid_b[k]++;
         }
     }
@@ -1002,6 +1014,65 @@ void EGS_ShieldApplication::outputResults() {
                        100.0 * sigma_frac, fom);
     }
 
+    // ---- Bunch-contribution diagnostics ------------------------------------
+    //
+    // sigma above is the standard error of a mean over bunches.  It is only
+    // trustworthy if many bunches genuinely contribute.  With a heavy-tailed
+    // per-bunch distribution -- which is what deep shells produce, since a
+    // shell's score can hinge on one rare high-weight history -- a handful of
+    // bunches carry the result, and both the mean and its error are poorly
+    // determined however many bunches were run.
+    //
+    // Kish's effective sample size measures this:
+    //
+    //     N_eff = (sum x)^2 / sum x^2 = n / (1 + CV^2)
+    //
+    // with CV the coefficient of variation of the per-bunch values.  N_eff = n
+    // when all bunches contribute equally; N_eff << n when few do.  Both sums
+    // are already accumulated, so this costs nothing.
+    //
+    // max_ratio gives the complementary picture the sums cannot: the single
+    // largest bunch, and how far above the mean it sits.
+    const double neff_warn = 0.05;   // flag shells below 5% effective usage
+
+    int n_flagged = 0;
+    for (int k = 0; k < n_scoring; k++) {
+        if (n_valid_b[k] < 2 || sum_ratio2[k] <= 0.0) continue;
+        double neff = sum_ratio[k] * sum_ratio[k] / sum_ratio2[k];
+        if (neff < neff_warn * n_valid_b[k]) n_flagged++;
+    }
+    if (n_flagged > 0) {
+        egsWarning("\n  *** %d shell(s) have an effective bunch count below %.0f%% of\n"
+                   "  *** the bunches run: their sigma is unreliable and the mean may\n"
+                   "  *** be biased by a few high-weight bunches.  Set\n"
+                   "  *** 'bunch statistics = yes' for the per-shell breakdown.\n",
+                   n_flagged, 100.0 * neff_warn);
+    }
+
+    if (bunch_stats) {
+        egsInformation("\n  Per-shell bunch-contribution statistics\n");
+        egsInformation("  %-6s  %-9s  %-8s  %-9s  %-8s  %-12s  %-8s\n",
+                       "Region", "eta/mfp", "CV", "N_eff", "N_eff/n",
+                       "max bunch", "max/mean");
+        egsInformation("  %s\n", string(72, '-').c_str());
+        for (int k = 0; k < n_scoring; k++) {
+            int nv = n_valid_b[k];
+            if (nv < 2 || sum_ratio2[k] <= 0.0) continue;
+            double mean = sum_ratio[k] / nv;
+            double eta  = (sum_Kp[k] > 0.0 && sum_Kp0[k] > 0.0)
+                          ? -std::log(sum_Kp[k] / sum_Kp0[k]) : 0.0;
+            double neff = sum_ratio[k] * sum_ratio[k] / sum_ratio2[k];
+            double var  = (sum_ratio2[k] - sum_ratio[k] * sum_ratio[k] / nv) / (nv - 1);
+            double cv   = std::sqrt(std::max(var, 0.0)) / std::max(mean, 1e-30);
+            egsInformation("  %-6d  %-9.4f  %-8.3f  %-9.1f  %-8.4f  %-12.6g  %-8.1f\n",
+                           scoring_reg[k], eta, cv, neff, neff / nv,
+                           max_ratio[k], max_ratio[k] / std::max(mean, 1e-30));
+        }
+        egsInformation("\n  N_eff = (sum r)^2 / sum r^2, r = per-bunch K_tot/K_pri (Kish).\n"
+                       "  N_eff ~ n means every bunch contributes; N_eff << n means a few\n"
+                       "  dominate and sigma understates the true uncertainty.\n");
+    }
+
     // ---- Speed and efficiency summary ----
     long long total_source = (long long)n_completed * n_per_bunch;
     double speed = (total_cpu_time_ > 0)
@@ -1012,8 +1083,8 @@ void EGS_ShieldApplication::outputResults() {
                    n_completed, n_bunches, total_source, total_cpu_time_, speed);
     egsInformation("  eta = -ln(K_pri/K_pri_unattenuated), the transmission-weighted\n"
                    "  optical depth along the forced-detection rays.\n");
-    egsInformation("  FOM = 1/(sigma_BUF^2 * T);  higher is better."
-                   "  Expect ~constant with depth for this algorithm.\n");
+    egsInformation("  FOM = 1/(sigma_BUF^2 * T);  higher is better.  Expect a plateau in\n"
+                   "  the deep, cascade-driven shells; it falls steeply before that.\n");
     egsInformation("\n");
 }
 
@@ -1066,7 +1137,7 @@ int EGS_ShieldApplication::outputData() {
     for (int k = 0; k < n_scoring; k++)
         (*data_out) << sum_ratio[k]  << " " << sum_ratio2[k] << " "
                     << sum_Kt[k]     << " " << sum_Kp[k]     << " "
-                    << sum_Kp0[k]    << " "
+                    << sum_Kp0[k]    << " " << max_ratio[k]  << " "
                     << n_valid_b[k]  << endl;
     return (*data_out) ? 0 : 99;
 }
@@ -1078,7 +1149,7 @@ int EGS_ShieldApplication::readData() {
     for (int k = 0; k < n_scoring; k++)
         (*data_in) >> sum_ratio[k]  >> sum_ratio2[k]
                    >> sum_Kt[k]     >> sum_Kp[k]
-                   >> sum_Kp0[k]
+                   >> sum_Kp0[k]    >> max_ratio[k]
                    >> n_valid_b[k];
     return (*data_in) ? 0 : 99;
 }
@@ -1091,13 +1162,14 @@ int EGS_ShieldApplication::addState(istream &data) {
     n_completed     += nc;
     total_cpu_time_ += tcpu;
     for (int k = 0; k < n_scoring; k++) {
-        double sr, sr2, skt, skp, skp0; int nv;
-        data >> sr >> sr2 >> skt >> skp >> skp0 >> nv;
+        double sr, sr2, skt, skp, skp0, mx; int nv;
+        data >> sr >> sr2 >> skt >> skp >> skp0 >> mx >> nv;
         sum_ratio[k]  += sr;
         sum_ratio2[k] += sr2;
         sum_Kt[k]     += skt;
         sum_Kp[k]     += skp;
         sum_Kp0[k]    += skp0;
+        if (mx > max_ratio[k]) max_ratio[k] = mx;   // max, not sum
         n_valid_b[k]  += nv;
     }
     return data ? 0 : 99;
@@ -1135,7 +1207,7 @@ int EGS_ShieldApplication::combineResults() {
 
     // Snapshots for rollback.
     vector<double> s_ratio(n_scoring), s_ratio2(n_scoring), s_Kt(n_scoring),
-           s_Kp(n_scoring), s_Kp0(n_scoring);
+           s_Kp(n_scoring), s_Kp0(n_scoring), s_max(n_scoring);
     vector<int>    s_valid(n_scoring);
 
     EGS_Float last_cpu = 0;
@@ -1159,6 +1231,7 @@ int EGS_ShieldApplication::combineResults() {
             s_Kt[k]     = sum_Kt[k];
             s_Kp[k]     = sum_Kp[k];
             s_Kp0[k]    = sum_Kp0[k];
+            s_max[k]    = max_ratio[k];
             s_valid[k]  = n_valid_b[k];
         }
 
@@ -1172,6 +1245,7 @@ int EGS_ShieldApplication::combineResults() {
                 sum_Kt[k]     = s_Kt[k];
                 sum_Kp[k]     = s_Kp[k];
                 sum_Kp0[k]    = s_Kp0[k];
+                max_ratio[k]  = s_max[k];
                 n_valid_b[k]  = s_valid[k];
             }
             ++nbad;
@@ -1216,6 +1290,7 @@ void EGS_ShieldApplication::resetCounter() {
         sum_Kt[k]     = 0.0;
         sum_Kp[k]     = 0.0;
         sum_Kp0[k]    = 0.0;
+        max_ratio[k]  = 0.0;
         n_valid_b[k]  = 0;
     }
 }
@@ -1249,6 +1324,7 @@ EGS_ShieldApplication::~EGS_ShieldApplication() {
     delete [] sum_Kt;
     delete [] sum_Kp;
     delete [] sum_Kp0;
+    delete [] max_ratio;
     delete [] n_valid_b;
 }
 
