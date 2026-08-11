@@ -204,6 +204,7 @@ public:
           containers(nullptr), snapshots(nullptr),
           E_Muen_Rho(nullptr),
           cascade_diag(false), bunch_stats(false),
+          cascade_cutoff(1e-10), comb_target_in(0),
           n_bunches(100), n_per_bunch(1000000LL),
           current_bunch(0), n_completed(0),
           sum_ratio(nullptr), sum_ratio2(nullptr),
@@ -315,6 +316,8 @@ private:
     // ---- Bunch bookkeeping ----
     bool      cascade_diag;    // print the replay-cascade trace (input option)
     bool      bunch_stats;     // print per-shell bunch-contribution stats (input)
+    double    cascade_cutoff;  // stop cascade below this fraction of w_initial
+    int       comb_target_in;  // combing population target; <=0 -> derive/preserve
     int       n_bunches;
     long long n_per_bunch;
     int       current_bunch;
@@ -630,6 +633,41 @@ int EGS_ShieldApplication::initScoring() {
     // looks untrustworthy.
     bunch_stats  = options->getInput("bunch statistics", choice, 0) ? true : false;
 
+    // Replay-cascade weight cutoff.  The cascade stops once the surviving weight
+    // falls below this fraction of its initial value.
+    //
+    // CRITICAL: this must be smaller than exp(-eta_max) for the deepest shell,
+    // or the cascade is truncated before it reaches the outer combing shells and
+    // the deep results are silently wrong.  At 100 mfp exp(-100) = 4e-44, so a
+    // cutoff of 1e-10 stops the cascade at roughly 44 mfp -- with containers
+    // still full, so their pending contributions are discarded as well and the
+    // damage reaches inward.  Symptom: BUF -> exactly 1.000 (K_tot == K_pri) at
+    // the deep shells, with the shells just inside them biased low.
+    //
+    // The default 1e-10 is kept for backward compatibility with the 9-shell
+    // inputs, where the cascade completed in ~10 iterations and happened to
+    // finish just as the threshold fired.  Any geometry with more combing
+    // shells, or reaching deeper, must set this explicitly.
+    cascade_cutoff = 1e-10;
+    options->getInput("cascade weight cutoff", cascade_cutoff);
+    if (cascade_cutoff <= 0 || cascade_cutoff >= 1) {
+        egsWarning("\n*** 'cascade weight cutoff' = %g is outside (0,1);"
+                   " using 1e-10\n", cascade_cutoff);
+        cascade_cutoff = 1e-10;
+    }
+
+    // Population target for the combing operation.  n_target <= 0 selects the
+    // Divide-et-Impera rule proper: w_bar = sum(w_i)/N, which preserves the
+    // arriving population.  A positive value caps the population, at the cost
+    // of culling arrivals above it.
+    //
+    // Default 0 means "derive from photons per bunch" (comb_interval*10), the
+    // historical behaviour.  Lower it when running many combing shells: peak
+    // memory is roughly 2 * n_combing * (container size) * 80 bytes, and the
+    // container size tracks this target.
+    comb_target_in = 0;
+    options->getInput("comb target", comb_target_in);
+
     sum_ratio  = new double[n_scoring]();
     sum_ratio2 = new double[n_scoring]();
     sum_Kt     = new double[n_scoring]();
@@ -749,7 +787,9 @@ int EGS_ShieldApplication::runSimulation() {
         // growing without bound.  We cap the population at comb_interval×10 so
         // that the container never grows much larger than that ceiling.
         const long long comb_interval = std::max(10000LL, n_per_bunch / 100);
-        const int       comb_target   = (int)(comb_interval * 10);
+        const int       comb_target   = comb_target_in > 0
+                                      ? comb_target_in
+                                      : (int)(comb_interval * 10);
 
         for (long long ih = 0; ih < n_per_bunch; ih++) {
             EGS_Vector x0, u0;
@@ -834,11 +874,41 @@ int EGS_ShieldApplication::runSimulation() {
                                occ.c_str());
             }
 
-            if (w_cur <= 0 || w_cur < 1e-10 * w_initial) {
+            if (w_cur <= 0 || w_cur < cascade_cutoff * w_initial) {
+                /* Warn if the cascade is stopped while containers still hold
+                 * particles: those pending contributions are discarded, which
+                 * biases the deep shells low and drives the outermost ones to
+                 * BUF == 1 exactly.  A correctly sized cutoff drains the
+                 * containers first. */
+                int n_left = 0, occupied = 0;
+                for (int m = 0; m < n_combing; m++) {
+                    int s = containers[m]->size();
+                    n_left += s;
+                    if (s > 0) occupied++;
+                }
                 if (diag)
                     egsInformation("  [cascade] STOP at iter %d: w_cur/w_ini = %.3g"
-                                   " < 1e-10 threshold\n\n", iter,
-                                   w_initial > 0 ? w_cur / w_initial : 0.0);
+                                   " < %g cutoff\n\n", iter,
+                                   w_initial > 0 ? w_cur / w_initial : 0.0,
+                                   cascade_cutoff);
+                if (n_left > 0 && current_bunch == 0) {
+                    /* exp(-eta_max) = smallest primary transmission over all
+                     * shells.  Primaries FD-score every shell during stage 0,
+                     * so these sums are already populated. */
+                    double tmin = 1.0;
+                    for (int k = 0; k < n_scoring; k++)
+                        if (sum_Kp0[k] > 0 && sum_Kp[k] / sum_Kp0[k] < tmin)
+                            tmin = sum_Kp[k] / sum_Kp0[k];
+                    egsWarning("\n*** egs_shield: replay cascade stopped with %d particle(s)"
+                               " still pending in %d of %d combing container(s).\n"
+                               "*** Those contributions are DISCARDED: deep shells will read"
+                               " low, and the outermost\n"
+                               "*** shells will read BUF = 1 exactly (K_tot == K_pri).\n"
+                               "*** Lower 'cascade weight cutoff' (currently %g); it must be"
+                               " below exp(-eta_max),\n"
+                               "*** i.e. below %.1e for the deepest shell in this geometry.\n\n",
+                               n_left, occupied, n_combing, cascade_cutoff, tmin);
+                }
                 break;
             }
 

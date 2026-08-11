@@ -1,0 +1,271 @@
+##############################################################################
+#
+# egs_shield deep-penetration BUF: 1 MeV photons in iron sphere, to 100 mfp.
+#
+# COMBING-STAGING VARIANT: 49 shells at 2.0 mfp spacing.
+#
+# Differs from test-Fe-1MeV-100mfp.egsinp ONLY in the combing surfaces and the
+# two cascade controls below.  Scoring positions, volumes, source, transport
+# parameters and RNG seeds are IDENTICAL, so runs are directly comparable and
+# any difference is attributable to staging alone.
+#
+#   test-Fe-1MeV-100mfp.egsinp :  9 shells, 10   mfp spacing (e^-10 = 0.0045%
+#                                 of the weight survives each stage)
+#   this input                 : 49 shells,  2.0 mfp spacing (e^-2 = 13.53%
+#                                 survives each stage)
+#
+# Rationale: the D&I presentation (shielding-variance-reduction.tex) specifies
+# 10-20 surfaces for a shield attenuating ~1e9 == e^20.7, i.e. ~1-2 mfp between
+# surfaces, and reports ~1% statistics from 100 bunches of 1e6 photons.  With
+# 10 mfp staging the population collapses between surfaces: of 1e6 equalised
+# particles the weight arriving at the next surface is worth ~45 effective
+# particles, which combing re-inflates into clones of a handful of ancestors --
+# the origin of the heavy tail (max/mean = 628, N_eff/n = 1.5% at 55 mfp).
+#
+# Combing positions are offset 0.25 mfp (= 0.53 cm of iron) from every scoring
+# position so that no combing surface coincides with a detector: a population-
+# control surface on a detector double-counts backward-going replayed photons.
+#
+# --------------------------------------------------------------------------
+# CRITICAL -- 'cascade weight cutoff'
+# --------------------------------------------------------------------------
+# The replay cascade stops when the surviving weight drops below this fraction
+# of its initial value.  It MUST be below exp(-eta_max); here eta_max = 100 mfp,
+# so exp(-eta_max) = 3.7e-44.  The former hard-coded default of 1e-10 was
+# calibrated for the 9-shell geometry, where the cascade completed in ~10
+# iterations and the threshold happened to fire just as it finished.  With
+# finer staging the cascade frontier advances ~1 container per iteration while
+# the weight falls ~7x per iteration, so 1e-10 truncates it: a 49-shell run
+# stopped at iteration 14 having reached only container 21 (44.25 mfp), with
+# ~4.5M particles still pending in containers that were never replayed.
+# Symptom: BUF = 1.000 exactly (K_tot == K_pri) at the deep shells, and shells
+# just inside them biased low (30 mfp read -13%, 35 mfp -56%).
+# egs_shield now warns when it stops with containers still occupied.
+#
+# --------------------------------------------------------------------------
+# 'comb target' and memory
+# --------------------------------------------------------------------------
+# Peak RSS is roughly 2 * n_combing * (container size) * 90 bytes, and the
+# container size tracks 'comb target' -- but containers grow freely DURING a
+# replay pass (the target is applied at pass start), so observed sizes run
+# ~3-4x the target.  Measured: 49 shells, target 1e5, 22 containers active ->
+# 1.5 GB.  With target 30000 and all 49 containers active, expect
+# roughly 1.0 GB.  Request at least --mem-per-cpu=4G.
+#
+# Lowering 'comb target' costs variance (heavier roulette at each surface); it
+# is a memory control, not a tuning knob.  Setting it <= 0 selects the D&I rule
+# proper, w_bar = sum(w_i)/N, which preserves the arriving population.
+#
+# MFP in iron at 1 MeV = 2.12007 cm (density 7.874 g/cm3, NIST XCOM).
+# Scoring shells: 1 um air.  Combing shells: 0.001 cm iron (negligible).
+# Geometry: 175 regions (0 = iron core, 174 = outer absorber at 110 mfp).
+#
+##############################################################################
+
+:start run control:
+    ncase = 2e8
+    nbatch = 1
+    rco type = uniform
+    interval wait time  = 60000
+    number of intervals = 180
+:stop run control:
+
+##############################################################################
+### Geometry
+##############################################################################
+:start geometry definition:
+
+    :start geometry:
+        name    = iron_sphere
+        library = egs_spheres
+        radii   = \
+               1.059985     1.060085     2.120020     2.120120     3.180055     3.180155 \
+               4.240090     4.240190     4.770157     4.771158     5.300125     5.300225 \
+               6.360160     6.360260     7.420195     7.420295     8.480230     8.480330 \
+               9.010298     9.011297     9.540265     9.540365    10.600300    10.600400 \
+              11.660335    11.660435    12.720370    12.720470    13.250438    13.251437 \
+              13.780405    13.780505    14.840440    14.840540    15.900475    15.900575 \
+              16.960510    16.960610    17.490578    17.491578    18.020545    18.020645 \
+              19.080580    19.080680    20.140615    20.140715    21.200650    21.200750 \
+              21.730718    21.731718    25.970858    25.971858    30.210998    30.211998 \
+              31.801000    31.801100    34.451138    34.452137    38.691278    38.692278 \
+              42.401350    42.401450    42.931418    42.932417    47.171558    47.172558 \
+              51.411698    51.412698    53.001700    53.001800    55.651838    55.652838 \
+              59.891978    59.892978    63.602050    63.602150    64.132118    64.133118 \
+              68.372258    68.373258    72.612398    72.613398    74.202400    74.202500 \
+              76.852538    76.853538    81.092678    81.093678    84.802750    84.802850 \
+              85.332818    85.333818    89.572958    89.573958    93.813098    93.814098 \
+              95.403100    95.403200    98.053238    98.054238   102.293378   102.294378 \
+             106.003450   106.003550   106.533518   106.534518   110.773658   110.774658 \
+             115.013798   115.014798   116.603800   116.603900   119.253938   119.254938 \
+             123.494078   123.495078   127.204150   127.204250   127.734218   127.735218 \
+             131.974357   131.975358   136.214498   136.215498   137.804500   137.804600 \
+             140.454638   140.455638   144.694778   144.695778   148.404850   148.404950 \
+             148.934918   148.935918   153.175058   153.176058   157.415198   157.416198 \
+             159.005200   159.005300   161.655338   161.656338   165.895477   165.896478 \
+             169.605550   169.605650   170.135618   170.136618   174.375758   174.376758 \
+             178.615898   178.616898   180.205900   180.206000   182.856038   182.857038 \
+             187.096178   187.097178   190.806250   190.806350   191.336318   191.337318 \
+             195.576458   195.577458   199.816598   199.817598   201.406600   201.406700 \
+             204.056738   204.057738   208.296878   208.297878   212.006950   212.007050 \
+             233.207700
+
+        :start media input:
+            media = iron air
+            # air scoring shells (all other regions default to iron)
+            set medium =    1 1
+            set medium =    3 1
+            set medium =    5 1
+            set medium =    7 1
+            set medium =   11 1
+            set medium =   13 1
+            set medium =   15 1
+            set medium =   17 1
+            set medium =   21 1
+            set medium =   23 1
+            set medium =   25 1
+            set medium =   27 1
+            set medium =   31 1
+            set medium =   33 1
+            set medium =   35 1
+            set medium =   37 1
+            set medium =   41 1
+            set medium =   43 1
+            set medium =   45 1
+            set medium =   47 1
+            set medium =   55 1
+            set medium =   61 1
+            set medium =   69 1
+            set medium =   75 1
+            set medium =   83 1
+            set medium =   89 1
+            set medium =   97 1
+            set medium =  103 1
+            set medium =  111 1
+            set medium =  117 1
+            set medium =  125 1
+            set medium =  131 1
+            set medium =  139 1
+            set medium =  145 1
+            set medium =  153 1
+            set medium =  159 1
+            set medium =  167 1
+            set medium =  173 1
+        :stop media input:
+    :stop geometry:
+
+    simulation geometry = iron_sphere
+
+:stop geometry definition:
+
+##############################################################################
+### Media definition (PEGS-less: cross sections built at run time)
+##############################################################################
+:start media definition:
+
+    ae = 0.521
+    ue = 2.511
+    ap = 0.010
+    up = 2.0
+
+    :start iron:
+        density correction file = iron
+    :stop iron:
+
+    :start air:
+        density correction file = air_dry_nearsealevel
+    :stop air:
+
+:stop media definition:
+
+##############################################################################
+### Source
+##############################################################################
+:start source definition:
+
+    :start source:
+        name      = point_source
+        library   = egs_isotropic_source
+        charge    = 0
+        :start spectrum:
+            type   = monoenergetic
+            energy = 1
+        :stop spectrum:
+        :start shape:
+            type     = point
+            position = 0 0 0
+        :stop shape:
+    :stop source:
+
+    simulation source = point_source
+
+:stop source definition:
+
+:start rng definition:
+    type = xoshiro256++
+    initial seeds = 13579 24680
+:stop rng definition:
+
+##############################################################################
+### Scoring options
+##############################################################################
+:start scoring options:
+
+    geometry name = iron_sphere
+
+    # 38 scoring shells: 20 fine (0.5-10 mfp) + 18 coarse (15-100 mfp)
+    scoring regions = \
+            1     3     5     7    11    13    15    17    21    23 \
+           25    27    31    33    35    37    41    43    45    47 \
+           55    61    69    75    83    89    97   103   111   117 \
+          125   131   139   145   153   159   167   173
+
+    # V = 4*pi*r^2*1e-4 cm3 -- identical to test-Fe-1MeV-100mfp.egsinp
+    scoring volumes = \
+         1.412E-03  5.648E-03  1.271E-02  2.259E-02  3.530E-02 \
+         5.083E-02  6.919E-02  9.037E-02  1.144E-01  1.412E-01 \
+         1.709E-01  2.033E-01  2.386E-01  2.768E-01  3.177E-01 \
+         3.615E-01  4.081E-01  4.575E-01  5.097E-01  5.648E-01 \
+        1.2708E+00 2.2593E+00 3.5304E+00 5.0846E+00 6.9186E+00 \
+        9.0367E+00 1.1437E+01 1.4121E+01 1.7086E+01 2.0334E+01 \
+        2.3864E+01 2.7676E+01 3.1772E+01 3.6149E+01 4.0808E+01 \
+        4.5750E+01 5.0975E+01 5.6482E+01
+
+    # 49 combing shells, 2.0 mfp spacing, offset 0.25 mfp off every detector
+    combing regions = \
+            9    19    29    39    49    51    53    57    59    63 \
+           65    67    71    73    77    79    81    85    87    91 \
+           93    95    99   101   105   107   109   113   115   119 \
+          121   123   127   129   133   135   137   141   143   147 \
+          149   151   155   157   161   163   165   169   171
+
+    emuen file = $EGS_HOME/egs_kerma/emuen_rho_air_1keV-20MeV.data
+
+    n bunches         = 100
+    photons per bunch = 1000000
+
+    cascade weight cutoff = 1e-50     # must be < exp(-eta_max) = 3.7e-44
+    comb target           = 30000     # memory control; see header
+
+    bunch statistics   = yes
+    cascade diagnostic = yes
+
+:stop scoring options:
+
+:start variance reduction:
+:stop variance reduction:
+
+:start MC transport parameter:
+    Global ECUT                  = 0.521
+    Global PCUT                  = 0.010
+    Rayleigh scattering          = On
+    Photoelectron angular sampling = Off
+    Brems angular sampling       = Simple
+    Bound Compton scattering     = norej
+    Pair angular sampling        = Off
+    ESTEPE                       = 0.25
+    XIMAX                        = 0.5
+    Skin depth for BCA           = 3
+    Boundary crossing algorithm  = EXACT
+    Electron-step algorithm      = PRESTA-II
+:stop MC transport parameter:
