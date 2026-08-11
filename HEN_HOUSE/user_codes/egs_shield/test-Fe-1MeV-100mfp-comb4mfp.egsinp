@@ -27,27 +27,30 @@
 # control surface on a detector double-counts backward-going replayed photons.
 #
 # --------------------------------------------------------------------------
-# CRITICAL -- 'cascade weight cutoff'
+# 'cascade weight cutoff'
 # --------------------------------------------------------------------------
 # The replay cascade stops when the surviving weight drops below this fraction
 # of its initial value.  The binding constraint is NOT exp(-eta_max): it is
-# that the cascade frontier must REACH every combing container.
+# that the cascade frontier must REACH every combing container.  The frontier
+# advances about one container per iteration, so N containers need roughly
+# N+6 iterations, and the cutoff must not fire before then.
 #
-# The frontier advances about one container per iteration, while the weight
-# falls by a roughly constant factor per iteration -- measured at ~18x for
-# 4 mfp spacing.  So reaching N containers takes ~N+6 iterations and needs
+# Measured per-iteration weight decay (asymptotic, from the cascade traces):
 #
-#     cutoff  <  (per-iteration decay) ^ (N + 6)
+#     2 mfp spacing, 49 shells :  6.8x per iteration
+#     4 mfp spacing, 25 shells : 13.3x per iteration
 #
-# which for 18x decay is ~7e-40 at N=25 and ~3e-70 at N=49.  This is far
-# stricter than exp(-eta_max) = 4e-44, and it tightens rapidly as combing
-# shells are added.  egs_shield measures the decay from the run itself and
-# reports the required value if it detects truncation.
+# Finer staging attenuates less per stage, so the weight decays SLOWER per
+# iteration -- which partly compensates for needing more iterations.  1e-50
+# therefore suffices for both: it is reached near iteration 60 at 2 mfp
+# (need ~55) and near iteration 44 at 4 mfp (need ~31).
 #
 # Symptom of a cutoff set too high: BUF = 1.000 exactly (K_tot == K_pri) at
 # the deep shells, with the shells just inside them biased low.  A 49-shell
 # run at 1e-10 stopped after 14 iterations having reached only 44 mfp, giving
-# -13% at 30 mfp, -56% at 35 mfp and BUF = 1 beyond 45 mfp.
+# -13% at 30 mfp, -56% at 35 mfp and BUF = 1 beyond 45 mfp.  egs_shield now
+# detects this directly -- it warns if any container was never reached, and
+# sizes the recommendation from the decay measured in that run.
 #
 # Do NOT test convergence by asking whether the containers have drained.  They
 # never do: backscatter refills the shallower containers indefinitely, so a
@@ -246,7 +249,7 @@
     n bunches         = 100
     photons per bunch = 1000000
 
-    cascade weight cutoff = 1e-50     # must be < exp(-eta_max) = 3.7e-44
+    cascade weight cutoff = 1e-50     # see header; reached ~iter 60 (2 mfp) / 44 (4 mfp)
     comb target           = 50000     # memory control; see header
 
     bunch statistics   = yes
