@@ -854,7 +854,12 @@ int EGS_ShieldApplication::runSimulation() {
         }
 
         static const int MAX_ITER = 500;
+        /* Has the cascade frontier ever reached each container?  Used only for
+         * the truncation warning below. */
+        vector<bool> ever_filled(n_combing, false);
         for (int iter = 0; iter < MAX_ITER; iter++) {
+            for (int m = 0; m < n_combing; m++)
+                if (containers[m]->size() > 0) ever_filled[m] = true;
             double w_cur = 0;
             for (int m = 0; m < n_combing; m++)
                 for (int j = 0; j < containers[m]->size(); j++)
@@ -875,39 +880,55 @@ int EGS_ShieldApplication::runSimulation() {
             }
 
             if (w_cur <= 0 || w_cur < cascade_cutoff * w_initial) {
-                /* Warn if the cascade is stopped while containers still hold
-                 * particles: those pending contributions are discarded, which
-                 * biases the deep shells low and drives the outermost ones to
-                 * BUF == 1 exactly.  A correctly sized cutoff drains the
-                 * containers first. */
-                int n_left = 0, occupied = 0;
-                for (int m = 0; m < n_combing; m++) {
-                    int s = containers[m]->size();
-                    n_left += s;
-                    if (s > 0) occupied++;
-                }
                 if (diag)
                     egsInformation("  [cascade] STOP at iter %d: w_cur/w_ini = %.3g"
                                    " < %g cutoff\n\n", iter,
                                    w_initial > 0 ? w_cur / w_initial : 0.0,
                                    cascade_cutoff);
-                if (n_left > 0 && current_bunch == 0) {
-                    /* exp(-eta_max) = smallest primary transmission over all
-                     * shells.  Primaries FD-score every shell during stage 0,
-                     * so these sums are already populated. */
-                    double tmin = 1.0;
-                    for (int k = 0; k < n_scoring; k++)
-                        if (sum_Kp0[k] > 0 && sum_Kp[k] / sum_Kp0[k] < tmin)
-                            tmin = sum_Kp[k] / sum_Kp0[k];
-                    egsWarning("\n*** egs_shield: replay cascade stopped with %d particle(s)"
-                               " still pending in %d of %d combing container(s).\n"
-                               "*** Those contributions are DISCARDED: deep shells will read"
-                               " low, and the outermost\n"
-                               "*** shells will read BUF = 1 exactly (K_tot == K_pri).\n"
-                               "*** Lower 'cascade weight cutoff' (currently %g); it must be"
-                               " below exp(-eta_max),\n"
-                               "*** i.e. below %.1e for the deepest shell in this geometry.\n\n",
-                               n_left, occupied, n_combing, cascade_cutoff, tmin);
+                /* Truncation test: did the cascade frontier ever REACH every
+                 * combing container?  A container that was never populated
+                 * means no particle ever got that deep, so every scoring shell
+                 * beyond it received primaries only and reads BUF = 1 exactly.
+                 *
+                 * Do NOT test for containers still holding particles at the
+                 * stop: they always do.  Backscatter refills the shallower
+                 * containers indefinitely, so the cascade settles into a
+                 * quasi-steady population while its weight decays -- occupancy
+                 * never falls to zero even when fully converged. */
+                if (current_bunch == 0) {
+                    int unreached = 0, first = -1;
+                    for (int m = 0; m < n_combing; m++)
+                        if (!ever_filled[m]) {
+                            unreached++;
+                            if (first < 0) first = m;
+                        }
+                    if (unreached > 0) {
+                        /* Self-calibrating recommendation.  The frontier advances
+                         * about one container per iteration, and the weight falls
+                         * by a roughly constant factor per iteration -- measure
+                         * that factor from this run rather than assuming one, as
+                         * it depends strongly on the combing-shell spacing. */
+                        double per_iter = (iter > 0 && w_initial > 0 && w_cur > 0)
+                                        ? std::pow(w_cur / w_initial, 1.0 / iter)
+                                        : 0.1;
+                        double need = std::pow(per_iter, (double)(n_combing + 6));
+                        egsWarning("\n*** egs_shield: replay cascade TRUNCATED. %d of %d combing"
+                                   " container(s) were never\n"
+                                   "*** reached -- the frontier stopped at container %d after %d"
+                                   " iteration(s).\n"
+                                   "*** Every scoring shell beyond that combing shell receives"
+                                   " primaries only and\n"
+                                   "*** will read BUF = 1 exactly (K_tot == K_pri); shells just"
+                                   " inside it read low.\n"
+                                   "***\n"
+                                   "*** The frontier advances ~1 container per iteration while the"
+                                   " weight falls %.3g per\n"
+                                   "*** iteration in this run, so reaching all %d containers needs"
+                                   " 'cascade weight\n"
+                                   "*** cutoff' below about %.0e.  It is currently %g.\n\n",
+                                   unreached, n_combing, first - 1, iter,
+                                   per_iter, n_combing, need, cascade_cutoff);
+                    }
                 }
                 break;
             }

@@ -30,18 +30,30 @@
 # CRITICAL -- 'cascade weight cutoff'
 # --------------------------------------------------------------------------
 # The replay cascade stops when the surviving weight drops below this fraction
-# of its initial value.  It MUST be below exp(-eta_max); here eta_max = 100 mfp,
-# so exp(-eta_max) = 3.7e-44.  The former hard-coded default of 1e-10 was
-# calibrated for the 9-shell geometry, where the cascade completed in ~10
-# iterations and the threshold happened to fire just as it finished.  With
-# finer staging the cascade frontier advances ~1 container per iteration while
-# the weight falls ~7x per iteration, so 1e-10 truncates it: a 49-shell run
-# stopped at iteration 14 having reached only container 21 (44.25 mfp), with
-# ~4.5M particles still pending in containers that were never replayed.
-# Symptom: BUF = 1.000 exactly (K_tot == K_pri) at the deep shells, and shells
-# just inside them biased low (30 mfp read -13%, 35 mfp -56%).
-# egs_shield now warns when it stops with containers still occupied.
+# of its initial value.  The binding constraint is NOT exp(-eta_max): it is
+# that the cascade frontier must REACH every combing container.
 #
+# The frontier advances about one container per iteration, while the weight
+# falls by a roughly constant factor per iteration -- measured at ~18x for
+# 4 mfp spacing.  So reaching N containers takes ~N+6 iterations and needs
+#
+#     cutoff  <  (per-iteration decay) ^ (N + 6)
+#
+# which for 18x decay is ~7e-40 at N=25 and ~3e-70 at N=49.  This is far
+# stricter than exp(-eta_max) = 4e-44, and it tightens rapidly as combing
+# shells are added.  egs_shield measures the decay from the run itself and
+# reports the required value if it detects truncation.
+#
+# Symptom of a cutoff set too high: BUF = 1.000 exactly (K_tot == K_pri) at
+# the deep shells, with the shells just inside them biased low.  A 49-shell
+# run at 1e-10 stopped after 14 iterations having reached only 44 mfp, giving
+# -13% at 30 mfp, -56% at 35 mfp and BUF = 1 beyond 45 mfp.
+#
+# Do NOT test convergence by asking whether the containers have drained.  They
+# never do: backscatter refills the shallower containers indefinitely, so a
+# fully converged cascade still holds a large quasi-steady population while its
+# weight decays.  The 4 mfp run ended with ~1e6 particles pending across all
+# 25 containers and was correctly converged.
 # --------------------------------------------------------------------------
 # 'comb target' and memory
 # --------------------------------------------------------------------------
