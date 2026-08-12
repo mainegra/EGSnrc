@@ -117,14 +117,32 @@ def shell_volume(eta, mfp, t=SHELL_T):
     return 4.0 * math.pi * r * r * t
 
 
-def build_kerma_geometry(etas, mfp, n_fine):
+def build_kerma_geometry(etas, mfp, n_fine, is_step=None):
     """
-    Returns (radii, scoring_regions, groups) where groups is a list of
-    (r_first, r_last, importance) covering every region.
+    Returns (radii, scoring_regions, groups); groups is a list of
+    (r_first, r_last, importance) tiling every region.
 
-    Fine section: core + alternating pairs.  Coarse: groups of three with the
-    detector in the middle, so each importance transition lands midway between
-    detectors.
+    Fine section: core + alternating [detector, material] pairs, one flat
+    importance group.  Coarse section: k importance transitions per detector
+    gap, placed at the MIDPOINTS of k equal sub-intervals -- (2j+1)W/(2k) into
+    a gap of width W.  That construction has two properties worth stating:
+
+      * no transition can coincide with a detector, for any k (they land on
+        odd multiples of W/2k, detectors on multiples of W);
+      * the step is uniformly exp(W/k) everywhere, including across a detector,
+        because the last transition of one gap and the first of the next are
+        W/k apart.
+
+    is_step is the desired importance step in mfp.  None (default) gives one
+    transition per gap at its midpoint -- the production map, exp(W) per step.
+    Halving is_step doubles the transitions and halves the step exponent, which
+    is how the second map for the two-map regression test is built.
+
+    Why that test matters: splitting and Russian roulette are unbiased by
+    construction, so two importance maps MUST agree.  Disagreement is proof of
+    a bug and nothing else.  It is the only validation available on a material
+    with no external reference, and it is what exposed a lost forced-detection
+    score per split event at 287 sigma.
     """
     fine, coarse = etas[:n_fine], etas[n_fine:]
     radii, scoring = [], []
@@ -132,30 +150,33 @@ def build_kerma_geometry(etas, mfp, n_fine):
     for e in fine:
         r = e * mfp
         radii += [r - SHELL_T / 2, r + SHELL_T / 2]
-        scoring.append(len(radii) - 1)          # air shell region index
+        scoring.append(len(radii) - 1)
 
-    n_fine_reg = len(radii)                     # last fine region index
-    groups = []
+    # trans_at[i] = (radii index, eta) for every importance transition
+    trans_at = []
     prev = fine[-1]
     for e in coarse:
-        trans = 0.5 * (prev + e) * mfp          # midway between detectors
+        W = e - prev
+        k = 1 if not is_step else max(1, int(round(W / is_step)))
+        for j in range(k):
+            eta_t = prev + (2 * j + 1) * W / (2.0 * k)
+            radii.append(eta_t * mfp)
+            trans_at.append((len(radii) - 1, eta_t))
         r = e * mfp
-        radii += [trans, r - SHELL_T / 2, r + SHELL_T / 2]
-        # region i spans radii[i-1]->radii[i]; the three appended radii create
-        # regions [material, AIR, material], the detector being the last index.
-        scoring.append(len(radii) - 1)          # middle region of the group
+        radii += [r - SHELL_T / 2, r + SHELL_T / 2]
+        # region i spans radii[i-1]->radii[i]; the detector is the last index
+        scoring.append(len(radii) - 1)
         prev = e
 
-    radii.append(1.10 * etas[-1] * mfp)         # outer absorber
+    radii.append(1.10 * etas[-1] * mfp)          # outer absorber
 
-    # importance groups: everything up to the first transition is one group
-    groups.append((0, n_fine_reg, math.exp(fine[-1])))
-    first = n_fine_reg + 1
-    prev = fine[-1]
-    for j, e in enumerate(coarse):
-        inner = 0.5 * (prev + e)
-        groups.append((first + 3 * j, first + 3 * j + 2, math.exp(inner)))
-        prev = e
+    # A group runs from the region just inside one transition to the region
+    # ending at the next; its importance is exp(eta) at its own inner edge.
+    groups, start, imp_eta = [], 0, fine[-1]
+    for idx, eta_t in trans_at:
+        groups.append((start, idx, math.exp(imp_eta)))
+        start, imp_eta = idx + 1, eta_t
+    groups.append((start, len(radii) - 1, math.exp(imp_eta)))
     return radii, scoring, groups
 
 
@@ -327,8 +348,8 @@ def source_block(energy, seeds):
 :stop rng definition:"""
 
 
-def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds):
-    radii, scoring, groups = build_kerma_geometry(etas, mfp, n_fine)
+def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None):
+    radii, scoring, groups = build_kerma_geometry(etas, mfp, n_fine, is_step)
     check_kerma(radii, scoring, groups, mfp, etas)
     gname = f"{mat}_sphere"
     geom, media = media_blocks(mat, radii, scoring, gname)
@@ -508,6 +529,12 @@ def main():
     p.add_argument("--code", default="both", choices=["kerma", "shield", "both"])
     p.add_argument("--max-mfp", type=float, default=100.0)
     p.add_argument("--ncase", default="384e9")
+    p.add_argument("--is-step", type=float, default=None, metavar="MFP",
+                   help="egs_kerma importance step in mfp; default = one "
+                        "transition per detector gap (the production map). "
+                        "Halve it to build the second map for the two-map "
+                        "regression test, e.g. --is-step 2.5 against a 5 mfp "
+                        "detector spacing.")
     p.add_argument("--bunches", type=int, default=6400)
     p.add_argument("--per-bunch", type=int, default=1000000)
     p.add_argument("--comb-spacing", type=float, default=10.0)
@@ -541,7 +568,7 @@ def main():
 
     if a.code in ("kerma", "both"):
         txt, info = emit_kerma(a.material, a.energy, mfp, etas, n_fine,
-                               a.ncase, a.emuen, a.seeds)
+                               a.ncase, a.emuen, a.seeds, a.is_step)
         fn = f"{tag}_kerma.egsinp"
         open(fn, "w").write(txt)
         print(f"{fn}: {info['regions']} regions, {len(info['scoring'])} scoring, "
