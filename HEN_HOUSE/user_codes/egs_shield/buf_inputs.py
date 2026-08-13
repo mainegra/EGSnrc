@@ -102,6 +102,7 @@ DETECTOR_MEDIUM = "air"
 DETECTOR_DC     = "air_dry_nearsealevel"
 SHELL_T         = 1.0e-4         # air scoring shell thickness, cm (1 um)
 COMB_T          = 1.0e-3         # combing shell thickness, cm
+FD_GEOM_NAME    = "fd_envelope"  # egs_kerma forced-detection trigger envelope
 
 
 def default_schedule():
@@ -251,6 +252,23 @@ def check_kerma(radii, scoring, groups, mfp, etas):
     assert all(b >= a for a, b in zip(imps, imps[1:])), "importance not monotonic"
 
 
+def check_kerma_text(txt, radii, scoring):
+    """
+    Checks on the RENDERED input, not just the region arithmetic.
+
+    The structural checks above all passed on the inputs that silently ran in
+    track-length mode: the geometry and the importance map were correct, an
+    estimator-selecting key was simply absent.  A missing key is invisible to
+    any check that only looks at indices, so verify the emitted text too.
+    """
+    assert f"Default FD geometry = {FD_GEOM_NAME}" in txt, \
+        "FD geometry key missing -- egs_kerma would fall back to track-length"
+    assert f"name    = {FD_GEOM_NAME}" in txt, "FD envelope geometry not emitted"
+    r_out = radii[scoring[-1]]
+    assert f"radii   = {r_out:.6f}" in txt, \
+        "FD envelope does not enclose the outermost detector"
+
+
 def check_shield(radii, scoring, combing, mfp, etas):
     check_common(radii, scoring, mfp, etas)
     assert not (set(scoring) & set(combing)), \
@@ -269,6 +287,36 @@ def wrap(items, per, indent, width):
     return " \\\n".join(
         indent + " ".join(f"{x:>{width}}" for x in items[i:i + per])
         for i in range(0, len(items), per))
+
+
+def fd_envelope_block(radii, scoring):
+    """
+    Trigger envelope for egs_kerma's forced-detection estimator.
+
+    egs_kerma scores by FD only where 'Default FD geometry' names a geometry
+    the photon is in or heading into (egs_kerma.cpp:1376); with the key absent
+    fd_geom stays null and the code falls back SILENTLY to track-length scoring
+    (egs_kerma.cpp:233).  That fallback is catastrophic here and hard to spot:
+    K_tot still looks reasonable, but the primary kerma becomes a counting
+    experiment, so Kpri -- and hence every buildup factor -- dies wherever
+    ncase*exp(-eta) drops below ~1.  It cost a full production run at 2.1e10
+    histories, which truncated at 25 mfp.  The log line to check is
+    "Forced detection (FD):  ON".
+
+    This geometry is only a trigger volume: it is not the simulation geometry
+    and the FD ray trace still runs in the real one, so its medium is
+    irrelevant.  It must enclose every detector, hence the outer radius of the
+    outermost scoring shell.
+    """
+    r_out = radii[scoring[-1]]
+    return f"""    :start geometry:
+        name    = {FD_GEOM_NAME}
+        library = egs_spheres
+        radii   = {r_out:.6f}
+        :start media input:
+            media = {DETECTOR_MEDIUM}
+        :stop media input:
+    :stop geometry:"""
 
 
 def media_blocks(mat, radii, scoring, geom_name):
@@ -378,7 +426,7 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 
 :start run control:
     ncase = {ncase}
-    nbatch = 1
+    nbatch = 10
     rco type = uniform
     interval wait time  = 60000
     number of intervals = 180
@@ -387,6 +435,8 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 :start geometry definition:
 
 {geom}
+
+{fd_envelope_block(radii, scoring)}
 
     simulation geometry = {gname}
 
@@ -400,6 +450,10 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 
     score primaries = yes
     verbose = yes
+
+    # Without this key egs_kerma reverts silently to track-length scoring.
+    # Confirm "Forced detection (FD):  ON" in the .egslog before trusting a run.
+    Default FD geometry = {FD_GEOM_NAME}
 
     :start calculation geometry:
         geometry name = {gname}
@@ -422,6 +476,7 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 
 {TRANSPORT}
 """
+    check_kerma_text(hdr, radii, scoring)
     return hdr, dict(regions=len(radii), scoring=scoring, groups=groups)
 
 
