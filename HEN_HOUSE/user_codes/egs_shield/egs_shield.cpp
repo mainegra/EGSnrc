@@ -211,7 +211,8 @@ public:
           sum_Kt(nullptr), sum_Kp(nullptr), sum_Kp0(nullptr),
           max_ratio(nullptr),
           n_valid_b(nullptr),
-          total_cpu_time_(0.0)
+          total_cpu_time_(0.0),
+          n_jobs_comb(0)
     {}
 
     ~EGS_ShieldApplication();
@@ -336,6 +337,18 @@ private:
     int      *n_valid_b;       // # bunches with K_pri_b > 0
     double    total_cpu_time_; // accumulated CPU time over all bunches [s]
 
+    // ---- Between-job (batch) variance, built during combineResults() --------
+    // The bunch-level sigma above and this one estimate the same quantity by
+    // different batchings -- 6400 bunches vs ~800 job means.  They agree only
+    // if the per-bunch distribution is sampled well enough for its variance to
+    // be determined; a heavy tail makes both underestimates, and makes them
+    // disagree.  This is a batch-size scaling test, not an independent
+    // estimator: disagreement proves non-convergence, agreement does not prove
+    // convergence.  Combine-time only, so it never enters the .egsdat and the
+    // file format is unchanged.
+    vector<double> job_nr2;    // Σ_j n_j * rbar_j^2  = Σ_j (ΔΣratio)^2 / Δn_j
+    vector<int>    job_used;   // # jobs contributing >= 1 valid bunch, per shell
+    int            n_jobs_comb;
 
     /*------------------------------------------------------------------------
       scoreFD_all
@@ -676,6 +689,9 @@ int EGS_ShieldApplication::initScoring() {
     max_ratio  = new double[n_scoring]();
     n_valid_b  = new int[n_scoring]();
     n_completed = 0;
+
+    job_nr2.assign(n_scoring, 0.0);
+    job_used.assign(n_scoring, 0);
 
     // Enable ausgab calls needed for latch bookkeeping.
     // By default the framework only enables BeforeTransport..AfterTransport.
@@ -1164,6 +1180,61 @@ void EGS_ShieldApplication::outputResults() {
                        "  dominate and sigma understates the true uncertainty.\n");
     }
 
+    // ---- Between-job (batch) variance --------------------------------------
+    //
+    // Same quantity, coarser batching: sigma_bunch pools n_valid_b bunches,
+    // sigma_job pools J job means of ~n_valid_b/J bunches each.  With
+    //
+    //     sigma_b^2 estimated by  SS/(J-1),  SS = sum_j n_j (rbar_j - rbar)^2
+    //                                           = sum_j n_j rbar_j^2 - N rbar^2
+    //
+    // and Var(rbar) = sigma_b^2 / N, the two agree when the per-bunch variance
+    // is actually determined.  They diverge when it is not -- which is the
+    // point of printing them side by side.
+    //
+    // Read the ratio, not either column alone, and mind two things:
+    //   * sigma on sigma is 1/sqrt(2(J-1)) -- 2.5% at J=800.  A ratio inside
+    //     ~0.9-1.1 is agreement; do not read structure into it.
+    //   * BOTH are biased low under a heavy tail.  Agreement rules out one
+    //     specific failure; it does not demonstrate convergence.  Same trap as
+    //     N_eff: necessary, not sufficient.
+    if (n_jobs_comb >= 2) {
+        egsInformation("\n  Between-job (batch) vs between-bunch variance"
+                       "   [%d jobs combined]\n", n_jobs_comb);
+        egsInformation("  %-6s  %-9s  %-8s  %-12s  %-12s  %-9s\n",
+                       "Region", "eta/mfp", "jobs", "sigma_bunch%", "sigma_job%",
+                       "job/bunch");
+        egsInformation("  %s\n", string(66, '-').c_str());
+        for (int k = 0; k < n_scoring; k++) {
+            int nv = n_valid_b[k], J = job_used[k];
+            if (nv < 2 || J < 2 || sum_ratio2[k] <= 0.0) continue;
+            double mean = sum_ratio[k] / nv;
+            if (mean <= 0.0) continue;
+            double eta  = (sum_Kp[k] > 0.0 && sum_Kp0[k] > 0.0)
+                          ? -std::log(sum_Kp[k] / sum_Kp0[k]) : 0.0;
+
+            double var_b = (sum_ratio2[k] - sum_ratio[k] * sum_ratio[k] / nv)
+                           / (nv - 1);
+            double s_bunch = std::sqrt(std::max(var_b, 0.0) / nv) / mean;
+
+            double ss = job_nr2[k] - sum_ratio[k] * sum_ratio[k] / nv;
+            double var_j = std::max(ss, 0.0) / (J - 1);
+            double s_job = std::sqrt(var_j / nv) / mean;
+
+            egsInformation("  %-6d  %-9.4f  %-8d  %-12.4f  %-12.4f  %-9.2f\n",
+                           scoring_reg[k], eta, J,
+                           100.0 * s_bunch, 100.0 * s_job,
+                           s_bunch > 0 ? s_job / s_bunch : 0.0);
+        }
+        egsInformation("\n  Two batchings of the same data, not independent estimators.\n"
+                       "  Agreement (ratio ~1) is consistent with a converged variance;\n"
+                       "  a ratio well above 1 means the per-bunch estimate is missing\n"
+                       "  tail mass and the quoted sigma is too small.  Both are biased\n"
+                       "  low under a heavy tail, so agreement is necessary, not sufficient.\n"
+                       "  Uncertainty on sigma_job itself is 1/sqrt(2(J-1)) = %.1f%%.\n",
+                       100.0 / std::sqrt(2.0 * std::max(n_jobs_comb - 1, 1)));
+    }
+
     // ---- Speed and efficiency summary ----
     long long total_source = (long long)n_completed * n_per_bunch;
     double speed = (total_cpu_time_ > 0)
@@ -1295,6 +1366,9 @@ int EGS_ShieldApplication::combineResults() {
         "\n                      Suming the following .egsdat files:\n"
         "=======================================================================\n");
     resetCounter();
+    n_jobs_comb = 0;
+    std::fill(job_nr2.begin(),  job_nr2.end(),  0.0);
+    std::fill(job_used.begin(), job_used.end(), 0);
 
     // Snapshots for rollback.
     vector<double> s_ratio(n_scoring), s_ratio2(n_scoring), s_Kt(n_scoring),
@@ -1345,6 +1419,23 @@ int EGS_ShieldApplication::combineResults() {
         }
 
         ++ndat;
+
+        // Between-job batch statistics.  The snapshot taken above for rollback
+        // doubles as the "before" state, so job j's own contribution is a
+        // subtraction and costs nothing.  rbar_j = dS/dn is that job's mean
+        // ratio; accumulating n_j * rbar_j^2 = dS^2/dn gives the weighted
+        // between-job sum of squares later.  Weighting by dn matters because
+        // egs-parallel gives the first (n_bunches % np) jobs one extra bunch.
+        ++n_jobs_comb;
+        for (int k = 0; k < n_scoring; k++) {
+            int dn = n_valid_b[k] - s_valid[k];
+            if (dn > 0) {
+                double dS = sum_ratio[k] - s_ratio[k];
+                job_nr2[k] += dS * dS / dn;
+                job_used[k]++;
+            }
+        }
+
         EGS_I64   ncase = run->getNdone();
         EGS_Float cpu   = run->getCPUTime();
         egsInformation("%2d %-30s ncase=%-14lld cpu=%-11.2f\n",
