@@ -465,6 +465,24 @@ private:
     vector<int>    job_used;   // # jobs contributing >= 1 valid bunch, per shell
     int            n_jobs_comb;
 
+    // ---- Top-k bunch ratios, for leave-k-out sensitivity -------------------
+    // sigma and N_eff both describe the spread; neither says how much of the
+    // ANSWER rests on a few bunches.  Keeping the k largest per-bunch ratios
+    // lets outputResults() report how far the mean moves when the top 1, 2 ...
+    // k bunches are dropped, which is the number that matters: at 40 mfp the
+    // single largest of 6400 bunches carries 4.2% of the shell.
+    //
+    // Combines by merging sorted lists, so the top-k over all jobs is exact.
+    static const int N_TOPK = 5;
+    vector<double> topk;        // [n_scoring * N_TOPK], descending per shell
+    void insertTopK(int k, double v) {
+        double *a = &topk[(size_t)k * N_TOPK];
+        if (v <= a[N_TOPK - 1]) return;
+        int i = N_TOPK - 1;
+        while (i > 0 && a[i - 1] < v) { a[i] = a[i - 1]; --i; }
+        a[i] = v;
+    }
+
     // ---- Forced collision for primaries between combing surfaces -----------
     // scoreFD_all fills these on a primary trace: the first combing surface the
     // ray meets, its optical depth, and where the ray leaves it.  selectPhotonMFP
@@ -892,6 +910,7 @@ int EGS_ShieldApplication::initScoring() {
 
     job_nr2.assign(n_scoring, 0.0);
     job_used.assign(n_scoring, 0);
+    topk.assign((size_t)n_scoring * N_TOPK, 0.0);
     max_deep.assign(n_scoring, -1);
     pri_cross_sum.assign(n_combing, 0.0);
     pri_cross_wsum.assign(n_combing, 0.0);
@@ -1235,6 +1254,7 @@ void EGS_ShieldApplication::endBunch() {
             sum_Kt[k]     += Kt;
             sum_Kp[k]     += Kp;
             sum_Kp0[k]    += Kp0;
+            insertTopK(k, ratio);
             if (ratio > max_ratio[k]) {
                 max_ratio[k] = ratio;
                 // Which bunch owns the maximum, characterised by how deep its
@@ -1403,6 +1423,56 @@ void EGS_ShieldApplication::outputResults() {
                        "  dominate and sigma understates the true uncertainty.\n");
     }
 
+    // ---- Leave-k-out sensitivity -------------------------------------------
+    //
+    // The question sigma cannot answer: how much of the ANSWER rests on a few
+    // bunches?  Dropping the largest and re-forming the mean answers it
+    // directly.  A shell where removing 1 bunch in 6400 moves the mean by 4%
+    // is not a shell whose 4% sigma means what it looks like it means.
+    //
+    // This is the diagnostic the between-job comparison cannot provide.  With a
+    // single dominant bunch of value X among n, the between-bunch and
+    // between-job variances are algebraically forced to agree -- both reduce to
+    // X^2/n at any batch size -- so their ratio is blind to exactly this.
+    // Absent from .egsdat written before 2026-08-13.  Without the guard the
+    // table silently reports n/(n-j)-1 -- subtracting nothing while shrinking
+    // the denominator -- which looks like a real and alarming sensitivity.
+    bool have_topk = false;
+    for (int k = 0; k < n_scoring; k++)
+        if (topk[(size_t)k * N_TOPK] > 0.0) { have_topk = true; break; }
+    if (bunch_stats && !have_topk) {
+        egsInformation("\n  Leave-k-out sensitivity unavailable: no top-k data in the\n"
+                       "  .egsdat file(s), which means they were written before this\n"
+                       "  diagnostic existed.  Re-run to get it.\n");
+    }
+    if (bunch_stats && have_topk) {
+        egsInformation("\n  Leave-k-out sensitivity of the mean"
+                       "   [top %d bunches per shell]\n", N_TOPK);
+        egsInformation("  %-6s  %-9s  %-12s", "Region", "eta/mfp", "BUF");
+        for (int j = 1; j <= N_TOPK; j++) egsInformation("  drop%-6d", j);
+        egsInformation("\n  %s\n", string(50 + 10 * N_TOPK, '-').c_str());
+        for (int k = 0; k < n_scoring; k++) {
+            int nv = n_valid_b[k];
+            if (nv <= N_TOPK + 1) continue;
+            double mean = sum_ratio[k] / nv;
+            if (mean <= 0.0) continue;
+            egsInformation("  %-6d  %-9.4f  %-12.6g", scoring_reg[k],
+                           (sum_Kp[k] > 0.0 && sum_Kp0[k] > 0.0)
+                           ? -std::log(sum_Kp[k] / sum_Kp0[k]) : 0.0, mean);
+            double s = sum_ratio[k];
+            for (int j = 0; j < N_TOPK; j++) {
+                s -= topk[(size_t)k * N_TOPK + j];
+                double m = s / (nv - j - 1);
+                egsInformation("  %+9.3f", 100.0 * (m - mean) / mean);
+            }
+            egsInformation("\n");
+        }
+        egsInformation("\n  Percent shift in BUF when the largest 1, 2 ... %d bunches are\n"
+                       "  removed.  Shifts of order 1/n are what an untailed distribution\n"
+                       "  gives; anything far larger means the shell is carried by those\n"
+                       "  few bunches and its sigma is optimistic however many were run.\n",
+                       N_TOPK);
+    }
 
     // ---- Between-job (batch) variance --------------------------------------
     //
@@ -1590,6 +1660,18 @@ int EGS_ShieldApplication::outputData() {
                     << sum_Kp0[k]    << " " << max_ratio[k]  << " "
                     << n_valid_b[k]  << endl;
 
+    // Top-k block, written LAST and read optionally, so that a file produced
+    // here still combines with a binary that predates it and -- more usefully
+    // -- so the 6400-bunch datasets already on disk remain readable.  Appending
+    // fields to the per-shell lines instead would have made an old file's
+    // shells misalign, which is how the sum_Kp0 addition broke compatibility on
+    // 2026-08-10.
+    (*data_out) << "TOPK " << N_TOPK << endl;
+    for (int k = 0; k < n_scoring; k++) {
+        for (int j = 0; j < N_TOPK; j++)
+            (*data_out) << topk[(size_t)k * N_TOPK + j] << " ";
+        (*data_out) << endl;
+    }
     return (*data_out) ? 0 : 99;
 }
 
@@ -1623,7 +1705,28 @@ int EGS_ShieldApplication::addState(istream &data) {
         if (mx > max_ratio[k]) max_ratio[k] = mx;   // max, not sum
         n_valid_b[k]  += nv;
     }
-    return data ? 0 : 99;
+    if (!data) return 99;
+
+    // Optional top-k block.  Absent from files written before 2026-08-13; a
+    // clean EOF there is not an error, so clear the failbit and carry on with
+    // an empty top-k rather than rejecting the file.
+    string tag;
+    if (data >> tag && tag == "TOPK") {
+        int kk = 0;
+        data >> kk;
+        if (!data || kk < 1) return 99;
+        for (int k = 0; k < n_scoring; k++)
+            for (int j = 0; j < kk; j++) {
+                double v = 0;
+                data >> v;
+                if (!data) return 99;
+                insertTopK(k, v);   // merges sorted lists: exact global top-k
+            }
+    }
+    else {
+        data.clear();
+    }
+    return 0;
 }
 
 /*----------------------------------------------------------------------------
@@ -1774,6 +1877,7 @@ void EGS_ShieldApplication::resetCounter() {
         max_ratio[k]  = 0.0;
         n_valid_b[k]  = 0;
     }
+    std::fill(topk.begin(), topk.end(), 0.0);
 }
 
 
