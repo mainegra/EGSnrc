@@ -212,7 +212,10 @@ public:
           max_ratio(nullptr),
           n_valid_b(nullptr),
           total_cpu_time_(0.0),
-          n_jobs_comb(0)
+          n_jobs_comb(0),
+          forced_collision(false), fc_found(false),
+          fc_Lambda(0), fc_ireg(-1), fc_m(-1),
+          pri_diag(false), deepest_pri_b(-1)
     {}
 
     ~EGS_ShieldApplication();
@@ -226,6 +229,24 @@ public:
       (b) Kill photons that enter a combing shell.  The FD contribution for
           this free path was already scored inside selectPhotonMFP.
     ------------------------------------------------------------------------*/
+    /* latch layout.  Bits 0..29 count interactions, so a photon that has not
+       yet scattered has them all clear.  Bit 30 is NO_FD: "this photon's
+       primary FD contribution is already booked".  It is set on the source
+       photon straight after its single full-range scoreFD_all(true), and is
+       inherited by every forced-collision descendant -- which is what keeps
+       K_pri a single deterministic ray from the source however many segments
+       the primary is subsequently staged through.
+
+       Every "is this still a primary" test must mask bit 30 off.  Using
+       latch != 0 directly would classify a staged primary as scattered and
+       kill it at the next combing surface.  ++latch at an interaction leaves
+       bit 30 untouched (the counter cannot reach 2^30), so the flag survives
+       scattering -- harmlessly, since a scattered photon is never asked. */
+    static const int NO_FD_FLAG = (1 << 30);
+    static bool isPrimary(int latch) {
+        return (latch & ~NO_FD_FLAG) == 0;
+    }
+
     int ausgab(int iarg) override {
         int np = the_stack->np - 1;
 
@@ -246,9 +267,26 @@ public:
         // If we killed primaries here, they could not scatter in the outer iron
         // and their secondaries (heading inward) would never contribute to the
         // combing-shell scoring — causing a systematic downward bias in BUF.
-        if (ir >= 0 && ir < nreg && is_combing[ir] && latch != 0) {
+        //
+        // With 'forced collision = yes' a primary can no longer get here at all:
+        // its collided branch is forced to interact before the surface and its
+        // uncollided branch is banked AT the surface, so this exemption becomes
+        // unreachable rather than merely unused.  It is kept because the option
+        // defaults off.
+        if (ir >= 0 && ir < nreg && is_combing[ir] && !isPrimary(latch)) {
             the_stack->wt[np]    = 0;
             the_epcont->idisc = -1;
+        }
+        // Diagnostic: a primary reaching a combing surface is the one particle
+        // that is neither banked nor killed there.  Count them, and record how
+        // deep any primary got in this bunch.  Under forced collision this
+        // must read zero, which is how you confirm the option took effect.
+        else if (pri_diag && ir >= 0 && ir < nreg && is_combing[ir]
+                 && isPrimary(latch)) {
+            int m = combing_idx[ir];
+            pri_cross_b[m]++;
+            pri_cross_wsum[m] += the_stack->wt[np];
+            if (m > deepest_pri_b) deepest_pri_b = m;
         }
         return 0;
     }
@@ -258,8 +296,85 @@ public:
       path via the $SELECT-PHOTON-MFP macro override in egs_shield.macros.
     ------------------------------------------------------------------------*/
     void selectPhotonMFP(EGS_Float &dpmfp) {
-        bool primary = (the_stack->latch[the_stack->np - 1] == 0);
-        scoreFD_all(primary);
+        int  np      = the_stack->np - 1;
+        int  latch   = the_stack->latch[np];
+        bool primary = isPrimary(latch);
+
+        // FD scoring.  A primary scores once, on its first free path, over the
+        // full ray to the geometry boundary; NO_FD then suppresses every later
+        // call for that lineage.  Scattered photons score each free path and
+        // stop at the first combing surface, as before.
+        bool score_as_primary = primary && !(latch & NO_FD_FLAG);
+        if (primary) {
+            // Always TRACE, even when the scoring is suppressed.  The trace is
+            // what fills the fc_* record, and a replayed primary carries NO_FD
+            // precisely so that it does not re-score -- if that also skipped
+            // the trace, fc_found and fc_x/fc_Lambda/fc_m would still hold the
+            // PREVIOUS particle's values, and this one would bank a copy at a
+            // foreign exit point and force its collision against a foreign
+            // Lambda.  Measured as a coherent positive bias in BUF growing with
+            // depth (+0.03% at 0.5 mfp to +0.09% at 2.5 mfp) before the trace
+            // and the scoring were separated.
+            //
+            // A trace-only call returns at the first combing surface, so it
+            // costs a fraction of a full scoring pass.
+            scoreFD_all(true, score_as_primary);
+            if (score_as_primary) {
+                the_stack->latch[np] = latch | NO_FD_FLAG;
+            }
+        }
+        else {
+            scoreFD_all(false);
+        }
+
+        // ---- Forced collision between combing surfaces ---------------------
+        //
+        // Analog transport lets a primary reach a combing surface with its full
+        // weight and probability exp(-Lambda) -- at 10 mfp spacing, ~4 arrivals
+        // per 10^6-photon bunch carrying weight 1 into a container whose
+        // population sits at wbar ~ 10^-9.  comb() then splits that one particle
+        // toward n_target copies and roulettes everything else away, so a bunch's
+        // deep shells become clones of a single ancestor.  Measured: 4.0% of the
+        // weight arriving at the first surface, in ~1 particle out of ~10^5.
+        //
+        // Forced collision replaces the sampling with the split it is estimating:
+        //
+        //     uncollided   w * T          banked AT the surface, T = exp(-Lambda)
+        //     collided     w * (1 - T)    interacts inside the segment, at
+        //                                 lambda = -ln(1 - xi(1 - T))
+        //
+        // The weights sum to w, so it is unbiased.  What changes is that the
+        // uncollided branch now arrives with certainty at weight w*T instead of
+        // with probability T at weight w -- the same expected weight, at the
+        // local scale, so comb() roulettes it down instead of splitting it up.
+        //
+        // scoreFD_all already ray-traced this direction, so Lambda to the first
+        // combing surface and the exit point come back from that trace for free.
+        if (forced_collision && primary && fc_found) {
+            EGS_Float T = std::exp(-fc_Lambda);
+            // T == 1 would leave the collided branch weightless and the sampling
+            // below degenerate; T == 0 leaves nothing to bank.  Both mean the
+            // segment is not worth forcing, so fall through to analog.
+            if (T > 1e-300 && T < 1.0 - 1e-9) {
+                EGS_Float w = the_stack->wt[np];
+
+                EGS_Particle vp;
+                vp.q     = 0;
+                vp.latch = the_stack->latch[np];   // primary, NO_FD set
+                vp.E     = the_stack->E[np];
+                vp.wt    = w * T;
+                vp.x     = fc_x;
+                vp.u     = EGS_Vector(the_stack->u[np], the_stack->v[np],
+                                      the_stack->w[np]);
+                vp.ir    = fc_ireg;
+                containers[fc_m]->save(vp);
+
+                the_stack->wt[np] = w * (1.0 - T);
+                dpmfp = -std::log(1.0 - rndm->getUniform() * (1.0 - T));
+                return;
+            }
+        }
+
         dpmfp = -std::log(1.0 - rndm->getUniform());
     }
 
@@ -350,6 +465,43 @@ private:
     vector<int>    job_used;   // # jobs contributing >= 1 valid bunch, per shell
     int            n_jobs_comb;
 
+    // ---- Forced collision for primaries between combing surfaces -----------
+    // scoreFD_all fills these on a primary trace: the first combing surface the
+    // ray meets, its optical depth, and where the ray leaves it.  selectPhotonMFP
+    // then banks the uncollided branch there and forces the collided branch to
+    // interact short of it.  Single-threaded, one trace at a time, so a member
+    // is as safe as an out-parameter and keeps scoreFD_all's signature.
+    bool       forced_collision;   // input: 'forced collision'
+    bool       fc_found;
+    EGS_Float  fc_Lambda;          // optical depth, source position -> surface exit
+    EGS_Vector fc_x;               // exit point of the combing region
+    int        fc_ireg;            // region just beyond it
+    int        fc_m;               // combing-surface index
+
+    // ---- Primary-crossing diagnostic (per job; not combined) ---------------
+    // Primaries are the one species that is neither banked at a combing surface
+    // nor killed there: they transport analog straight through.  Their survival
+    // probability to the first surface is exp(-spacing) ~ 4.5e-5 at 10 mfp, and
+    // a survivor carries weight 1 against a combed population whose total weight
+    // has decayed by the same factor.  That is a rare high-weight event, and the
+    // hypothesis under test is that it is what produces the heavy per-bunch tail
+    // (N_eff/n ~ 0.015 at 55-65 mfp, one bunch in 6400 carrying ~10% of a shell).
+    bool           pri_diag;         // input: 'primary crossing diagnostic'
+    vector<double> pri_cross_sum;    // Σ over bunches of crossings, per surface
+    vector<double> pri_cross_wsum;   // Σ over bunches of crossing weight
+    vector<double> bank_wsum;        // Σ of weight BANKED at each surface, i.e.
+                                     // the scattered channel the primaries are
+                                     // competing with.  Their ratio is the
+                                     // decisive number and it does not require
+                                     // observing the rare deep crossing: it says
+                                     // what fraction of the weight arriving at a
+                                     // surface is carried by analog primaries.
+    vector<long long> pri_cross_b;   // crossings this bunch, per surface
+    int            deepest_pri_b;    // deepest surface a primary reached, this bunch
+    vector<int>    deep_hist;        // # bunches by deepest surface reached (+1 slot)
+    vector<int>    max_deep;         // deepest_pri of the bunch holding max_ratio[k]
+
+
     /*------------------------------------------------------------------------
       scoreFD_all
 
@@ -373,7 +525,7 @@ private:
       Returns -1 for primaries (always) or when geometry is exited without
       hitting a combing shell.
     ------------------------------------------------------------------------*/
-    int scoreFD_all(bool is_primary);
+    int scoreFD_all(bool is_primary, bool do_score = true);
 
     // Replay every particle in src as an independent shower.
     void replayContainer(TmpPhsp *src);
@@ -390,7 +542,7 @@ string EGS_ShieldApplication::revision = "$Revision: 0.3 $";
 /*----------------------------------------------------------------------------
   scoreFD_all
 ----------------------------------------------------------------------------*/
-int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
+int EGS_ShieldApplication::scoreFD_all(bool is_primary, bool do_score) {
     int np_idx = the_stack->np - 1;
     if (the_stack->E[np_idx] < the_bounds->pcut) return -1;
 
@@ -405,6 +557,8 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
     EGS_Float E     = the_stack->E[np_idx];
     EGS_Float wt    = the_stack->wt[np_idx];
     int       latch = the_stack->latch[np_idx];
+
+    fc_found = false;        // reset the forced-collision record for this trace
 
     EGS_Float Lambda = 0.0;
     int       imed   = -2;   // sentinel so first medium triggers refresh
@@ -446,7 +600,7 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
             int       med_after;
             int ireg_after = geometry->howfar(ireg, x, u, t_shell, &med_after);
 
-            if (t_shell < TSTEP_MAX) {
+            if (t_shell < TSTEP_MAX && do_score) {
                 EGS_Float emuen_rho = E_Muen_Rho->interpolateFast(gle);
                 EGS_Float unatt = wt * emuen_rho * t_shell / V_shell[k];
                 EGS_Float score = unatt * std::exp(-Lambda);
@@ -471,17 +625,41 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
         }
 
         // ---- Combing check — independent of scoring ----
-        // Fires whenever a scattered photon reaches any combing region,
-        // whether or not that region is also a scoring shell.
-        // The virtual photon is placed at the combing region's EXIT so the
-        // replayed particle starts in the correct medium on the far side.
-        if (!is_primary && is_combing[ireg]) {
+        // Fires whenever a photon's ray reaches any combing region, whether or
+        // not that region is also a scoring shell.  The virtual photon is
+        // placed at the combing region's EXIT so the replayed particle starts
+        // in the correct medium on the far side.
+        if (is_combing[ireg]) {
             EGS_Float t_comb = TSTEP_MAX;
             int       med_after;
             int ireg_after = geometry->howfar(ireg, x, u, t_comb, &med_after);
             // Include attenuation through the combing shell itself.
             // sigma here is for the medium just entered (same iron as surroundings).
             if (t_comb < TSTEP_MAX) Lambda += t_comb * sigma;
+
+            if (is_primary) {
+                // Record the first surface for the forced-collision split and
+                // KEEP GOING: a primary's FD trace must run the full ray, since
+                // it is the single deterministic pass that books K_pri at every
+                // shell out to 100 mfp.  Stopping here would truncate K_pri
+                // exactly the way the missing FD key truncated it on 2026-08-12.
+                if (!fc_found && t_comb < TSTEP_MAX && ireg_after >= 0) {
+                    fc_found  = true;
+                    fc_Lambda = Lambda;
+                    fc_x      = x + u * t_comb;   // combing region EXIT
+                    fc_ireg   = ireg_after;
+                    fc_m      = combing_idx[ireg];
+                    // Trace-only call: the record is all it was for.
+                    if (!do_score) return fc_m;
+                }
+                // Traverse the combing region and carry on down the ray.
+                if (t_comb >= TSTEP_MAX || ireg_after < 0) return -1;
+                x     += u * t_comb;
+                ireg   = ireg_after;
+                newmed = med_after;
+                continue;
+            }
+
             if (t_comb < TSTEP_MAX && ireg_after >= 0) {
                 EGS_Particle vp;
                 vp.q     = 0;
@@ -492,6 +670,7 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary) {
                 vp.u     = u;
                 vp.ir    = ireg_after;
                 containers[combing_idx[ireg]]->save(vp);
+                if (pri_diag) bank_wsum[combing_idx[ireg]] += vp.wt;
             }
             return combing_idx[ireg];
         }
@@ -646,6 +825,27 @@ int EGS_ShieldApplication::initScoring() {
     // looks untrustworthy.
     bunch_stats  = options->getInput("bunch statistics", choice, 0) ? true : false;
 
+    // Primary-crossing diagnostic.  Per-job output only: it is deliberately NOT
+    // written to the .egsdat, because adding a field there breaks combining
+    // against every file produced by an older binary (as the sum_Kp0 field did
+    // on 2026-08-10).  A diagnostic run needs tens of bunches, not thousands,
+    // so per-job tables are sufficient.
+    pri_diag     = options->getInput("primary crossing diagnostic", choice, 0)
+                   ? true : false;
+
+    // Forced collision for primaries between combing surfaces.  Off by default:
+    // it changes the transport, so an existing input must keep reproducing its
+    // existing answer unless the change is explicitly asked for.  With it off
+    // every code path below is the one that produced the validated results.
+    forced_collision = options->getInput("forced collision", choice, 0)
+                       ? true : false;
+    if (forced_collision && n_combing < 1) {
+        egsWarning("\n*** 'forced collision = yes' but no combing regions are"
+                   " defined:\n*** there is no surface to force against."
+                   "  Ignoring.\n\n");
+        forced_collision = false;
+    }
+
     // Replay-cascade weight cutoff.  The cascade stops once the surviving weight
     // falls below this fraction of its initial value.
     //
@@ -692,6 +892,12 @@ int EGS_ShieldApplication::initScoring() {
 
     job_nr2.assign(n_scoring, 0.0);
     job_used.assign(n_scoring, 0);
+    max_deep.assign(n_scoring, -1);
+    pri_cross_sum.assign(n_combing, 0.0);
+    pri_cross_wsum.assign(n_combing, 0.0);
+    bank_wsum.assign(n_combing, 0.0);
+    pri_cross_b.assign(n_combing, 0);
+    deep_hist.assign(n_combing + 1, 0);   // slot 0 = no surface reached
 
     // Enable ausgab calls needed for latch bookkeeping.
     // By default the framework only enables BeforeTransport..AfterTransport.
@@ -797,6 +1003,11 @@ int EGS_ShieldApplication::runSimulation() {
                        current_bunch + 1, my_n_bunches, n_per_bunch);
 
         for (int m = 0; m < n_combing; m++) containers[m]->clean();
+
+        if (pri_diag) {
+            std::fill(pri_cross_b.begin(), pri_cross_b.end(), 0);
+            deepest_pri_b = -1;
+        }
 
         // ---- Stage 0: source photons ----
         // Periodic combing every comb_interval photons keeps containers from
@@ -1024,9 +1235,21 @@ void EGS_ShieldApplication::endBunch() {
             sum_Kt[k]     += Kt;
             sum_Kp[k]     += Kp;
             sum_Kp0[k]    += Kp0;
-            if (ratio > max_ratio[k]) max_ratio[k] = ratio;
+            if (ratio > max_ratio[k]) {
+                max_ratio[k] = ratio;
+                // Which bunch owns the maximum, characterised by how deep its
+                // primaries got.  If the outlier bunches are systematically the
+                // ones where a primary reached a deep surface, the analog
+                // treatment of primaries is the tail's source.
+                if (pri_diag) max_deep[k] = deepest_pri_b;
+            }
             n_valid_b[k]++;
         }
+    }
+    if (pri_diag) {
+        for (int m = 0; m < n_combing; m++)
+            pri_cross_sum[m] += (double)pri_cross_b[m];
+        deep_hist[deepest_pri_b + 1]++;
     }
     n_completed++;
 }
@@ -1180,6 +1403,7 @@ void EGS_ShieldApplication::outputResults() {
                        "  dominate and sigma understates the true uncertainty.\n");
     }
 
+
     // ---- Between-job (batch) variance --------------------------------------
     //
     // Same quantity, coarser batching: sigma_bunch pools n_valid_b bunches,
@@ -1233,6 +1457,70 @@ void EGS_ShieldApplication::outputResults() {
                        "  low under a heavy tail, so agreement is necessary, not sufficient.\n"
                        "  Uncertainty on sigma_job itself is 1/sqrt(2(J-1)) = %.1f%%.\n",
                        100.0 / std::sqrt(2.0 * std::max(n_jobs_comb - 1, 1)));
+    }
+
+    // ---- Primary-crossing diagnostic ---------------------------------------
+    // Suppressed on the final combine: max_ratio[] is merged across jobs but
+    // max_deep[] is not (it is not in the .egsdat), so on a combine the two
+    // columns would describe different bunches.  Print only where this process
+    // ran the bunches itself -- a serial run, or an individual parallel job.
+    const bool is_combined_output = (getNparallel() > 0 && getIparallel() == 0);
+    if (pri_diag && n_completed > 0 && !is_combined_output) {
+        egsInformation("\n  Primary crossings of the combing surfaces"
+                       "   [this job only, %d bunches]\n", n_completed);
+        egsInformation("  %-8s  %-6s  %-14s  %-13s  %-13s  %-9s  %-9s\n",
+                       "Surface", "region", "crossings/bnch", "pri wt/bnch",
+                       "bank wt/bnch", "pri frac", "bnch deep");
+        egsInformation("  %s\n", string(86, '-').c_str());
+        for (int m = 0; m < n_combing; m++) {
+            double pw = pri_cross_wsum[m] / n_completed;
+            double bw = bank_wsum[m]      / n_completed;
+            egsInformation("  %-8d  %-6d  %-14.6g  %-13.6g  %-13.6g  %-9.4f  %-9d\n",
+                           m, combing_reg[m],
+                           pri_cross_sum[m] / n_completed, pw, bw,
+                           (pw + bw) > 0 ? pw / (pw + bw) : 0.0,
+                           deep_hist[m + 1]);
+        }
+        egsInformation("  %-8s  %-6s  %-14s  %-13s  %-13s  %-9s  %-9d\n",
+                       "none", "-", "-", "-", "-", "-", deep_hist[0]);
+
+        egsInformation("\n  Deepest surface reached by any primary, in the bunch holding\n"
+                       "  each shell's largest K_tot/K_pri:\n");
+        egsInformation("  %-6s  %-9s  %-10s  %-10s  %-12s\n",
+                       "Region", "eta/mfp", "max/mean", "max bunch", "deepest surf");
+        egsInformation("  %s\n", string(56, '-').c_str());
+        for (int k = 0; k < n_scoring; k++) {
+            if (n_valid_b[k] < 2) continue;
+            double mean = sum_ratio[k] / n_valid_b[k];
+            double eta  = (sum_Kp[k] > 0.0 && sum_Kp0[k] > 0.0)
+                          ? -std::log(sum_Kp[k] / sum_Kp0[k]) : 0.0;
+            egsInformation("  %-6d  %-9.4f  %-10.3f  %-10.6g  %-12d\n",
+                           scoring_reg[k], eta,
+                           max_ratio[k] / std::max(mean, 1e-30), max_ratio[k],
+                           max_deep[k]);
+        }
+        egsInformation("\n  A primary is neither banked at a combing surface nor killed\n"
+                       "  there; it transports analog, surviving with probability\n"
+                       "  exp(-spacing) and carrying weight 1 into a population whose\n"
+                       "  weight has decayed by the same factor.\n"
+                       "\n"
+                       "  'pri frac' is the decisive column and needs no rare event to\n"
+                       "  be observed: it is the share of the weight arriving at a\n"
+                       "  surface that is carried by analog primaries rather than by\n"
+                       "  banked scatter.  A share that grows with depth means the\n"
+                       "  primary channel dominates there, and since it is sampled\n"
+                       "  analog at probability exp(-spacing) it is then also the\n"
+                       "  dominant variance source.\n"
+                       "\n"
+                       "  'bnch deep'/'deepest surf' are the direct but expensive test:\n"
+                       "  they need enough bunches for a primary to actually reach a\n"
+                       "  deep surface -- at 10 mfp spacing that is one bunch in ~500\n"
+                       "  for surface 1 and far rarer beyond.  If 'deepest surf' runs\n"
+                       "  high exactly where 'max/mean' does, the rare high-weight\n"
+                       "  event is confirmed as the tail's source.  -1 means no primary\n"
+                       "  reached any surface.\n"
+                       "\n"
+                       "  Per-job only: this is not written to the .egsdat.\n");
     }
 
     // ---- Speed and efficiency summary ----
@@ -1301,6 +1589,7 @@ int EGS_ShieldApplication::outputData() {
                     << sum_Kt[k]     << " " << sum_Kp[k]     << " "
                     << sum_Kp0[k]    << " " << max_ratio[k]  << " "
                     << n_valid_b[k]  << endl;
+
     return (*data_out) ? 0 : 99;
 }
 
@@ -1362,10 +1651,10 @@ int EGS_ShieldApplication::combineResults() {
     // (egs_application.cpp:640).  Do the same here.
     //
     // Delegating to the base class instead -- which is what this did until
-    // 2026-08-13 -- produced a log indistinguishable from a good one: the base
-    // prints the same banner and the same per-file lines, so an 800-job combine
-    // listed all 800 files and simply had no batch-statistics table.  Nothing
-    // in the output indicated a different function had done the work.
+    // 2026-08-13 -- produced a log that was indistinguishable from a good one:
+    // the base prints the same banner and the same per-file lines, so an
+    // 800-job combine listed all 800 files and simply had no batch-statistics
+    // table.  Nothing indicated that a different function had done the work.
     static const int MAX_JOBS_SCAN = 8192;   // MAXIMUM_JOB_NUMBER, not exported
     int np = getNparallel();
     if (np <= 0) {
