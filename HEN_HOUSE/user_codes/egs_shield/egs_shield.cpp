@@ -1355,11 +1355,21 @@ int EGS_ShieldApplication::addState(istream &data) {
   listing below, not BUF, K or sigma.
 ----------------------------------------------------------------------------*/
 int EGS_ShieldApplication::combineResults() {
+    // A combine invoked without -P leaves n_parallel at 0.  That is a supported
+    // way to run one (egs_shield -i <input> with 'calculation = combine'), and
+    // EGS_Application::combineResults handles it by substituting
+    // MAXIMUM_JOB_NUMBER and scanning for whatever files exist
+    // (egs_application.cpp:640).  Do the same here.
+    //
+    // Delegating to the base class instead -- which is what this did until
+    // 2026-08-13 -- produced a log indistinguishable from a good one: the base
+    // prints the same banner and the same per-file lines, so an 800-job combine
+    // listed all 800 files and simply had no batch-statistics table.  Nothing
+    // in the output indicated a different function had done the work.
+    static const int MAX_JOBS_SCAN = 8192;   // MAXIMUM_JOB_NUMBER, not exported
     int np = getNparallel();
     if (np <= 0) {
-        // No job count given: nothing sensible to iterate over, and the base
-        // class has a fallback for it.
-        return EGS_AdvancedApplication::combineResults();
+        np = MAX_JOBS_SCAN;
     }
 
     egsInformation(
