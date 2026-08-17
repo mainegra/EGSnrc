@@ -173,6 +173,11 @@ public:
     void          clean()           { np = 0; }
     int           size()  const     { return np; }
     EGS_Particle &operator[](int j) { return p[j]; }
+    double        weight() const {
+        double w = 0.0;
+        for (int j = 0; j < np; j++) w += p[j].wt;
+        return w;
+    }
 
 private:
     int          ntot, np;
@@ -213,6 +218,7 @@ public:
           n_valid_b(nullptr),
           total_cpu_time_(0.0),
           n_jobs_comb(0),
+          fc_analog_w(0), fc_analog_n(0),
           forced_collision(false), fc_found(false),
           fc_Lambda(0), fc_ireg(-1), fc_m(-1),
           pri_diag(false), deepest_pri_b(-1)
@@ -369,12 +375,21 @@ public:
                 vp.ir    = fc_ireg;
                 containers[fc_m]->save(vp);
 
+                fc_in_w[fc_m]   += w;
+                fc_bank_w[fc_m] += w * T;
+                fc_coll_w[fc_m] += w * (1.0 - T);
+                fc_n_split[fc_m]++;
+
                 the_stack->wt[np] = w * (1.0 - T);
                 dpmfp = -std::log(1.0 - rndm->getUniform() * (1.0 - T));
                 return;
             }
         }
 
+        if (forced_collision && primary) {
+            fc_analog_w += the_stack->wt[np];
+            fc_analog_n++;
+        }
         dpmfp = -std::log(1.0 - rndm->getUniform());
     }
 
@@ -473,6 +488,18 @@ private:
     // single largest of 6400 bunches carries 4.2% of the shell.
     //
     // Combines by merging sorted lists, so the top-k over all jobs is exact.
+    // Every per-bunch ratio, not just the top few.  38 shells x 8 bunches is
+    // 2.4 kB per job file and ~1.9 MB combined at 6400 bunches -- nothing --
+    // and it is strictly more informative than any summary: sigma, N_eff,
+    // top-k, batch scaling, tail index and bootstrap intervals are all
+    // recoverable from it offline, and new questions can be asked of an old
+    // run without re-running it.  Dumped to <output>.bunchdat on the combine.
+    //
+    // This matters because the deep shells turn out to have a tail index below
+    // 2, i.e. infinite variance, where sigma is not a convergent quantity and
+    // the honest report is an interval estimated from the sample itself.
+    vector< vector<double> > bunch_r;   // [n_scoring][valid bunches]
+
     static const int N_TOPK = 5;
     vector<double> topk;        // [n_scoring * N_TOPK], descending per shell
     void insertTopK(int k, double v) {
@@ -489,6 +516,19 @@ private:
     // then banks the uncollided branch there and forces the collided branch to
     // interact short of it.  Single-threaded, one trace at a time, so a member
     // is as safe as an out-parameter and keeps scoreFD_all's signature.
+    // Weight-balance audit of the staged primary.  The split itself is exact by
+    // construction (w = w*T + w*(1-T)), so that is not what this measures.  The
+    // informative comparison is ACROSS stages: the weight entering the split at
+    // surface m should equal the weight banked at surface m-1, because combing
+    // and replay are weight-preserving in expectation.  A ratio above 1 that
+    // compounds per stage localises a leak to the bank -> comb -> replay path
+    // rather than to the split, which is what the 20-bunch 9-surface comparison
+    // pointed at (exact before the first surface, then ~1.1-1.25 per stage).
+    vector<double>    fc_in_w, fc_bank_w, fc_coll_w;
+    vector<long long> fc_n_split;
+    double            fc_analog_w;   // primary weight with no surface ahead
+    long long         fc_analog_n;
+
     bool       forced_collision;   // input: 'forced collision'
     bool       fc_found;
     EGS_Float  fc_Lambda;          // optical depth, source position -> surface exit
@@ -518,6 +558,33 @@ private:
     int            deepest_pri_b;    // deepest surface a primary reached, this bunch
     vector<int>    deep_hist;        // # bunches by deepest surface reached (+1 slot)
     vector<int>    max_deep;         // deepest_pri of the bunch holding max_ratio[k]
+
+    // ---- Scattered-channel comb()/replay weight ledger ---------------------
+    // bank_wsum (above) answers "how much weight arrives at a surface".  These
+    // answer a different question: does comb()'s stochastic rounding actually
+    // conserve that weight once it starts passing through the container ->
+    // comb -> replay pipeline, many hundreds to thousands of times per job?
+    //
+    // comb() is unbiased PER PARTICLE by construction (E[ncopies_j] = w_j/wbar
+    // exactly), so comb_after_w should equal comb_before_w in expectation at
+    // every call, with a per-call relative fluctuation of order 1/sqrt(n_target)
+    // from the stochastic rounding.  Summed over many calls, that fluctuation
+    // should average down -- if the CUMULATIVE ratio does not approach 1 as
+    // n_comb_calls grows, that is a real bug in comb() or its call sites, not
+    // sampling noise, and it is exactly the kind of placement-dependent
+    // artifact that could explain why A, B and C disagree with each other
+    // while each one's own primary-channel weight ledger balances exactly.
+    //
+    // Instrumented at BOTH call sites: the periodic Stage-0 downsizing
+    // (containers[m]->comb() during source transport) and the cascade replay
+    // loop (snapshots[m]->comb() before replayContainer()).  replay_in_w is
+    // the post-comb weight actually handed to shower() -- the input side of
+    // the one operation (replay) that the primary-channel audit cannot see at
+    // all, since replayed particles are ordinary scattered photons by then.
+    vector<double>    comb_before_w;   // Σ container weight immediately before comb()
+    vector<double>    comb_after_w;    // Σ container weight immediately after
+    vector<long long> n_comb_calls;    // how many times comb() ran on this surface
+    vector<double>    replay_in_w;     // Σ weight actually fed into shower() via replay
 
 
     /*------------------------------------------------------------------------
@@ -911,12 +978,21 @@ int EGS_ShieldApplication::initScoring() {
     job_nr2.assign(n_scoring, 0.0);
     job_used.assign(n_scoring, 0);
     topk.assign((size_t)n_scoring * N_TOPK, 0.0);
+    bunch_r.assign(n_scoring, vector<double>());
+    fc_in_w.assign(n_combing, 0.0);
+    fc_bank_w.assign(n_combing, 0.0);
+    fc_coll_w.assign(n_combing, 0.0);
+    fc_n_split.assign(n_combing, 0);
     max_deep.assign(n_scoring, -1);
     pri_cross_sum.assign(n_combing, 0.0);
     pri_cross_wsum.assign(n_combing, 0.0);
     bank_wsum.assign(n_combing, 0.0);
     pri_cross_b.assign(n_combing, 0);
     deep_hist.assign(n_combing + 1, 0);   // slot 0 = no surface reached
+    comb_before_w.assign(n_combing, 0.0);
+    comb_after_w.assign(n_combing, 0.0);
+    n_comb_calls.assign(n_combing, 0);
+    replay_in_w.assign(n_combing, 0.0);
 
     // Enable ausgab calls needed for latch bookkeeping.
     // By default the framework only enables BeforeTransport..AfterTransport.
@@ -926,6 +1002,56 @@ int EGS_ShieldApplication::initScoring() {
     setAusgabCall(AfterPhoto,    true);
     setAusgabCall(AfterPair,     true);
     setAusgabCall(AfterRayleigh, true);
+
+    // ---- Variance-reduction summary --------------------------------------
+    // egs_shield now layers three independent VR mechanisms, and a run's
+    // .egslog previously gave no single place to confirm which were active.
+    // That is exactly the gap that let egs_kerma silently fall back to
+    // track-length scoring for every input this generator produced until
+    // 2026-08-13 (12.6.17/12.6.20 in the research log) -- a missing or
+    // misread input key with no confirming banner cost a full production
+    // run before anyone noticed.  Print the equivalent confirmation here so
+    // 'was X actually on' is answered by a `grep` of the log, not by an
+    // inference from the input file.
+    egsInformation(
+        "\n===========================================================\n"
+        " Variance reduction techniques\n"
+        "===========================================================\n\n");
+    egsInformation(
+        " Forced detection (FD):        ON  (always -- FD is egs_shield's\n"
+        "                                     core estimator; fires at every\n"
+        "                                     free path via scoreFD_all)\n\n");
+    egsInformation(
+        " Population control (combing): %s\n", n_combing > 0 ? "ON" : "OFF");
+    if (n_combing > 0) {
+        egsInformation("   combing surfaces    = %d\n", n_combing);
+        egsInformation("   combing regions     =");
+        for (int m = 0; m < n_combing; m++) egsInformation(" %d", combing_reg[m]);
+        egsInformation("\n");
+        if (comb_target_in > 0)
+            egsInformation("   comb target         = %d (fixed population cap)\n",
+                           comb_target_in);
+        else
+            egsInformation("   comb target         = preserve arriving population"
+                           " (D&I rule, wbar = sum(w)/N)\n");
+        egsInformation("   cascade weight cutoff = %g\n", cascade_cutoff);
+    }
+    egsInformation("\n Forced collision (primaries): %s\n",
+                   forced_collision ? "ON" : "OFF");
+    if (forced_collision) {
+        egsInformation("   Between each pair of combing surfaces, a primary's\n"
+                       "   weight is split deterministically into an\n"
+                       "   uncollided branch (banked at the far surface) and a\n"
+                       "   collided branch (forced to interact inside the\n"
+                       "   segment).  K_pri is unaffected -- see 12.6.20/12.6.22\n"
+                       "   in the research log for the mechanism.  CONFIRM the\n"
+                       "   RNG in the block above is xoshiro256++, not a silent\n"
+                       "   fallback -- that exact failure mode (12.6.22) produced\n"
+                       "   a spurious combing-surface-placement dependence that\n"
+                       "   looked like a real bias in this estimator until traced\n"
+                       "   to the RNG on 2026-08-17.\n");
+    }
+    egsInformation("\n===========================================================\n\n");
 
     egsInformation("egs_shield: %d scoring shells, %d combing shells, "
                    "%d bunches of %lld photons\n",
@@ -1059,8 +1185,14 @@ int EGS_ShieldApplication::runSimulation() {
             finishShower();
 
             if ((ih + 1) % comb_interval == 0) {
-                for (int m = 0; m < n_combing; m++)
+                for (int m = 0; m < n_combing; m++) {
+                    if (pri_diag) {
+                        comb_before_w[m] += containers[m]->weight();
+                        n_comb_calls[m]++;
+                    }
                     containers[m]->comb(rndm, comb_target);
+                    if (pri_diag) comb_after_w[m] += containers[m]->weight();
+                }
             }
         }
 
@@ -1185,11 +1317,18 @@ int EGS_ShieldApplication::runSimulation() {
                 // Cap at current size: don't split when np < comb_target.
                 // Splitting would create a fixed-cost 100K-shower replay
                 // regardless of n_per_bunch, breaking time scaling.
+                if (pri_diag) {
+                    comb_before_w[m] += snapshots[m]->weight();
+                    n_comb_calls[m]++;
+                }
                 snapshots[m]->comb(rndm, std::min(snapshots[m]->size(), comb_target));
+                if (pri_diag) comb_after_w[m] += snapshots[m]->weight();
             }
             for (int m = 0; m < n_combing; m++)
-                if (snapshots[m]->size() > 0)
+                if (snapshots[m]->size() > 0) {
+                    if (pri_diag) replay_in_w[m] += snapshots[m]->weight();
                     replayContainer(snapshots[m]);
+                }
         }
 
         double bunch_time = timer.time();
@@ -1255,6 +1394,7 @@ void EGS_ShieldApplication::endBunch() {
             sum_Kp[k]     += Kp;
             sum_Kp0[k]    += Kp0;
             insertTopK(k, ratio);
+            bunch_r[k].push_back(ratio);
             if (ratio > max_ratio[k]) {
                 max_ratio[k] = ratio;
                 // Which bunch owns the maximum, characterised by how deep its
@@ -1529,12 +1669,110 @@ void EGS_ShieldApplication::outputResults() {
                        100.0 / std::sqrt(2.0 * std::max(n_jobs_comb - 1, 1)));
     }
 
+    const bool is_combined_output = (getNparallel() > 0 && getIparallel() == 0);
+
+    // ---- Forced-collision weight audit -------------------------------------
+    //
+    // Per stage the split is exact: w = w*T + w*(1-T).  What is NOT guaranteed
+    // exact is the hand-off between stages.  A primary banked at surface m is
+    // dropped into a container, combed with everything else there, and replayed;
+    // comb() preserves total weight only in EXPECTATION.  So
+    //
+    //     w_in[m]  should equal  w_bank[m-1]
+    //
+    // and the last column is the whole point of this table.  A value near 1 at
+    // every surface clears the bank -> comb -> replay path; a value above 1 that
+    // compounds is the leak, and its size per stage should reproduce the ~1.1 to
+    // 1.25 per-stage excess seen in BUF at 25-50 mfp.
+    //
+    // w_in[0] is a special case: those primaries come straight from the source,
+    // not from a container, so its ratio column is blank.
+    if (forced_collision && pri_diag && !is_combined_output) {
+        egsInformation("\n  Forced-collision weight audit"
+                       "   [cumulative, this job]\n");
+        egsInformation("  %-6s  %-6s  %-12s  %-12s  %-12s  %-12s  %-10s\n",
+                       "surf", "region", "splits", "w_in", "w_bank", "w_coll",
+                       "w_in/w_bank(prev)");
+        egsInformation("  %s\n", string(88, '-').c_str());
+        double coll_tot = 0, bank_last = 0;
+        for (int m = 0; m < n_combing; m++) {
+            coll_tot += fc_coll_w[m];
+            egsInformation("  %-6d  %-6d  %-12lld  %-12.6g  %-12.6g  %-12.6g",
+                           m, combing_reg[m], fc_n_split[m],
+                           fc_in_w[m], fc_bank_w[m], fc_coll_w[m]);
+            if (m == 0) egsInformation("  %-10s\n", "(source)");
+            else if (fc_bank_w[m-1] > 0)
+                egsInformation("  %-10.4f\n", fc_in_w[m] / fc_bank_w[m-1]);
+            else egsInformation("  %-10s\n", "-");
+            bank_last = fc_bank_w[m];
+        }
+        egsInformation("\n  Primary weight accounted for: collided %.6g + banked at last"
+                       " surface %.6g\n  + fell through to analog %.6g (%lld free paths)"
+                       "  =  %.6g\n",
+                       coll_tot, bank_last, fc_analog_w, fc_analog_n,
+                       coll_tot + bank_last + fc_analog_w);
+        egsInformation("  Source weight this job: %.6g"
+                       "   (equal only if no primary escaped the geometry)\n",
+                       (double)n_completed * (double)n_per_bunch);
+        egsInformation("\n  w_in[m] should equal w_bank[m-1]: comb() and replay preserve\n"
+                       "  weight in expectation, so a ratio that sits above 1 and\n"
+                       "  compounds per stage is a leak in bank -> comb -> replay, not\n"
+                       "  in the split.\n");
+    }
+
+    // ---- Scattered-channel comb()/replay weight ledger ---------------------
+    //
+    // The primary-channel audit above traces one specific quantity (the staged
+    // primary split) and has come back exact in three independent placements.
+    // It says nothing about the ordinary scattered population, which passes
+    // through comb() and replayContainer() far more often -- hundreds to
+    // thousands of times per job -- and is the one part of the cascade the
+    // primary audit cannot see, since a replayed particle is an ordinary
+    // scattered photon by the time it is transported again.
+    //
+    // comb() is unbiased per particle by construction: E[ncopies_j] = w_j/wbar
+    // exactly, so the cumulative after/before ratio should approach 1 as
+    // n_comb_calls grows, with per-call noise of order 1/sqrt(comb_target).  A
+    // ratio that does NOT approach 1 -- especially one that differs between
+    // placements with different comb-call densities -- would be a real bug in
+    // comb() or a call site, not sampling noise, and is a live candidate for
+    // the A/B/C disagreement now that the primary ledger is cleared.
+    //
+    // Runs whenever 'primary crossing diagnostic = yes', independent of
+    // 'forced collision', so the same table is available for the FC-off
+    // control arm -- comb() and replay exist regardless of forced collision.
+    if (pri_diag && n_completed > 0 && !is_combined_output) {
+        egsInformation("\n  Scattered-channel comb()/replay weight ledger"
+                       "   [cumulative, this job]\n");
+        egsInformation("  %-6s  %-6s  %-10s  %-13s  %-13s  %-13s  %-13s  %-13s\n",
+                       "surf", "region", "comb calls", "bank(scat)", "comb_before",
+                       "comb_after", "after/before", "replay_in");
+        egsInformation("  %s\n", string(96, '-').c_str());
+        for (int m = 0; m < n_combing; m++) {
+            double ratio = comb_before_w[m] > 0
+                          ? comb_after_w[m] / comb_before_w[m] : 0.0;
+            egsInformation("  %-6d  %-6d  %-10lld  %-13.6g  %-13.6g  %-13.6g  %-13.7f  %-13.6g\n",
+                           m, combing_reg[m], n_comb_calls[m],
+                           bank_wsum[m] / n_completed,
+                           comb_before_w[m], comb_after_w[m], ratio,
+                           replay_in_w[m]);
+        }
+        egsInformation("\n  after/before should approach 1 as comb calls accumulate; the\n"
+                       "  per-call noise scale is roughly 1/sqrt(comb_target), so with\n"
+                       "  comb_target ~1e5 a single call fluctuates by ~0.3%%, and the\n"
+                       "  CUMULATIVE ratio over N calls should tighten toward 1 by\n"
+                       "  roughly 1/sqrt(N).  A ratio that stays away from 1 as N grows\n"
+                       "  is not noise.\n"
+                       "  replay_in is the post-comb weight actually handed to shower():\n"
+                       "  the one quantity in this cascade the primary-channel audit\n"
+                       "  above cannot see at all.\n");
+    }
+
     // ---- Primary-crossing diagnostic ---------------------------------------
     // Suppressed on the final combine: max_ratio[] is merged across jobs but
     // max_deep[] is not (it is not in the .egsdat), so on a combine the two
     // columns would describe different bunches.  Print only where this process
     // ran the bunches itself -- a serial run, or an individual parallel job.
-    const bool is_combined_output = (getNparallel() > 0 && getIparallel() == 0);
     if (pri_diag && n_completed > 0 && !is_combined_output) {
         egsInformation("\n  Primary crossings of the combing surfaces"
                        "   [this job only, %d bunches]\n", n_completed);
@@ -1598,6 +1836,36 @@ void EGS_ShieldApplication::outputResults() {
     double speed = (total_cpu_time_ > 0)
                    ? total_source / total_cpu_time_ : 0.0;
     egsInformation("\n");
+    // Dump every per-bunch ratio for offline analysis.  Written on a serial run
+    // or the final combine only; an individual parallel job's 8 bunches are not
+    // worth a file.
+    if (bunch_stats && !(getNparallel() > 0 && getIparallel() > 0)) {
+        size_t nb = 0;
+        for (int k = 0; k < n_scoring; k++) nb += bunch_r[k].size();
+        if (nb > 0) {
+            string fn = egsJoinPath(getAppDir(),
+                                    getFinalOutputFile() + ".bunchdat");
+            ofstream f(fn.c_str());
+            if (f) {
+                f << "# per-bunch K_tot/K_pri.  one block per shell.\n";
+                f << "# region eta n_bunches, then the values\n";
+                for (int k = 0; k < n_scoring; k++) {
+                    double eta = (sum_Kp[k] > 0.0 && sum_Kp0[k] > 0.0)
+                                 ? -std::log(sum_Kp[k] / sum_Kp0[k]) : 0.0;
+                    f << scoring_reg[k] << " " << eta << " "
+                      << bunch_r[k].size() << "\n";
+                    for (size_t m = 0; m < bunch_r[k].size(); m++)
+                        f << bunch_r[k][m] << (((m+1) % 10) ? " " : "\n");
+                    f << "\n";
+                }
+                egsInformation("\n  Per-bunch ratios written to %s\n"
+                               "  (%lu values; sigma, N_eff, tail index and bootstrap\n"
+                               "  intervals are all recoverable from this offline)\n",
+                               fn.c_str(), (unsigned long)nb);
+            }
+        }
+    }
+
     egsInformation("  Bunches: %d of %d  |  Source photons: %lld  |  CPU: %.1f s"
                    "  |  Speed: %.0f photons/s\n",
                    n_completed, n_bunches, total_source, total_cpu_time_, speed);
@@ -1672,6 +1940,13 @@ int EGS_ShieldApplication::outputData() {
             (*data_out) << topk[(size_t)k * N_TOPK + j] << " ";
         (*data_out) << endl;
     }
+    (*data_out) << "BUNCHR" << endl;
+    for (int k = 0; k < n_scoring; k++) {
+        (*data_out) << bunch_r[k].size();
+        for (size_t j = 0; j < bunch_r[k].size(); j++)
+            (*data_out) << " " << bunch_r[k][j];
+        (*data_out) << endl;
+    }
     return (*data_out) ? 0 : 99;
 }
 
@@ -1722,6 +1997,25 @@ int EGS_ShieldApplication::addState(istream &data) {
                 if (!data) return 99;
                 insertTopK(k, v);   // merges sorted lists: exact global top-k
             }
+    }
+    else {
+        data.clear();
+        return 0;      // pre-2026-08-13 file: no TOPK, so no BUNCHR either
+    }
+
+    string tag2;
+    if (data >> tag2 && tag2 == "BUNCHR") {
+        for (int k = 0; k < n_scoring; k++) {
+            size_t nb = 0;
+            data >> nb;
+            if (!data) return 99;
+            for (size_t j = 0; j < nb; j++) {
+                double v = 0;
+                data >> v;
+                if (!data) return 99;
+                bunch_r[k].push_back(v);
+            }
+        }
     }
     else {
         data.clear();
@@ -1878,6 +2172,7 @@ void EGS_ShieldApplication::resetCounter() {
         n_valid_b[k]  = 0;
     }
     std::fill(topk.begin(), topk.end(), 0.0);
+    for (size_t k = 0; k < bunch_r.size(); k++) bunch_r[k].clear();
 }
 
 
