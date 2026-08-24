@@ -512,7 +512,7 @@ private:
 
     // ---- Forced collision for primaries between combing surfaces -----------
     // scoreFD_all fills these on a primary trace: the first combing surface the
-    // ray meets, its optical depth, and where the ray leaves it.  selectPhotonMFP
+    // ray meets, the number of mean free paths to it, and where the ray leaves it.  selectPhotonMFP
     // then banks the uncollided branch there and forces the collided branch to
     // interact short of it.  Single-threaded, one trace at a time, so a member
     // is as safe as an out-parameter and keeps scoreFD_all's signature.
@@ -531,7 +531,7 @@ private:
 
     bool       forced_collision;   // input: 'forced collision'
     bool       fc_found;
-    EGS_Float  fc_Lambda;          // optical depth, source position -> surface exit
+    EGS_Float  fc_Lambda;          // number of mean free paths, source position -> surface exit
     EGS_Vector fc_x;               // exit point of the combing region
     int        fc_ireg;            // region just beyond it
     int        fc_m;               // combing-surface index
@@ -591,7 +591,7 @@ private:
       scoreFD_all
 
       Ray-trace from the current photon position along direction u,
-      accumulating optical depth Lambda.
+      accumulating Lambda, the number of mean free paths traversed.
 
       At each scoring shell encountered:
         score += w * exp(-Lambda) * (E*muen/rho) * t_shell / V_shell[k]
@@ -695,7 +695,7 @@ int EGS_ShieldApplication::scoreFD_all(bool is_primary, bool do_score) {
                     // Same score with the attenuation factor removed.  The
                     // ratio of the two sums is the primary transmission along
                     // the FD rays, from which outputResults() recovers the
-                    // effective optical depth.  Costs one multiply-add per
+                    // effective number of mean free paths.  Costs one multiply-add per
                     // primary FD score.
                     sum_pri0[k] += unatt;
                 }
@@ -1207,7 +1207,7 @@ int EGS_ShieldApplication::runSimulation() {
         //      to shallower combing shells — both handled identically).
         //
         // Convergence is geometric: each pass attenuates by exp(-Λ_min)
-        // where Λ_min is the optical depth to the nearest combing shell.
+        // where Λ_min is the number of mean free paths to the nearest combing shell.
         // Track total weight to exit early once the remaining weight is
         // negligible relative to its initial value (< 1e-10).
         //
@@ -1418,26 +1418,27 @@ void EGS_ShieldApplication::endBunch() {
 /*----------------------------------------------------------------------------
   outputResults
 
-  Effective optical depth (eta/mfp column)
-  ---------------------------------------
+  Effective number of mean free paths (eta/mfp column)
+  -----------------------------------------------------
   The FD estimator already carries the exact quantity we want.  Every primary
-  score is w·exp(-Λ)·(E μen/ρ)·t/V, where Λ is the optical depth accumulated
-  along the ray from the source to the shell.  Accumulating the same score
-  without exp(-Λ) (sum_Kp0) makes the ratio ΣK_pri/ΣK_pri0 the primary
-  transmission, so
+  score is w·exp(-Λ)·(E μen/ρ)·t/V, where Λ is the number of mean free paths
+  accumulated along the ray from the source to the shell (path length divided
+  by the local mean free path length, summed across any media crossed).
+  Accumulating the same score without exp(-Λ) (sum_Kp0) makes the ratio
+  ΣK_pri/ΣK_pri0 the primary transmission, so
 
       η_eff = -ln( ΣK_pri / ΣK_pri0 )
 
   For a monoenergetic point source and concentric shells every primary ray to
-  a given shell is identical, so η_eff is exactly that shell's optical depth,
-  to machine precision and with no user input.
+  a given shell is identical, so η_eff is exactly that shell's number of mean
+  free paths, to machine precision and with no user input.
 
   For a polyenergetic source the per-photon η varies with energy and η_eff
   becomes -ln⟨exp(-η)⟩, the transmission-weighted mean — which is the right
   characteristic depth here, because it is precisely the attenuation that
   forms the denominator of the buildup factor.  It is not the arithmetic mean
-  optical depth, and for a broad spectrum it will sit below it (low-energy
-  components are attenuated away and stop contributing).  The same expression
+  number of mean free paths, and for a broad spectrum it will sit below it
+  (low-energy components are attenuated away and stop contributing).  The same expression
   also handles extended or off-axis sources, where different primaries reach a
   shell along different chords.  Deriving it beats an input-supplied mfp,
   which would additionally assume a spherical geometry and a source at the
@@ -1870,7 +1871,7 @@ void EGS_ShieldApplication::outputResults() {
                    "  |  Speed: %.0f photons/s\n",
                    n_completed, n_bunches, total_source, total_cpu_time_, speed);
     egsInformation("  eta = -ln(K_pri/K_pri_unattenuated), the transmission-weighted\n"
-                   "  optical depth along the forced-detection rays.\n");
+                   "  number of mean free paths along the forced-detection rays.\n");
     egsInformation("  FOM = 1/(sigma_BUF^2 * T);  higher is better.  Expect a plateau in\n"
                    "  the deep, cascade-driven shells; it falls steeply before that.\n");
     egsInformation("\n");
