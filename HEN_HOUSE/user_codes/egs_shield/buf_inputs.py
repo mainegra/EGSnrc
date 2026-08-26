@@ -118,15 +118,15 @@ def shell_volume(eta, mfp, t=SHELL_T):
     return 4.0 * math.pi * r * r * t
 
 
-def build_kerma_geometry(etas, mfp, n_fine, is_step=None):
+def build_kerma_geometry(etas, mfp, n_fine, is_step=None, fine_is_step=None):
     """
     Returns (radii, scoring_regions, groups); groups is a list of
     (r_first, r_last, importance) tiling every region.
 
-    Fine section: core + alternating [detector, material] pairs, one flat
-    importance group.  Coarse section: k importance transitions per detector
-    gap, placed at the MIDPOINTS of k equal sub-intervals -- (2j+1)W/(2k) into
-    a gap of width W.  That construction has two properties worth stating:
+    Both sections use the SAME construction: k importance transitions per
+    detector gap, placed at the MIDPOINTS of k equal sub-intervals --
+    (2j+1)W/(2k) into a gap of width W.  That has two properties worth
+    stating:
 
       * no transition can coincide with a detector, for any k (they land on
         odd multiples of W/2k, detectors on multiples of W);
@@ -134,28 +134,51 @@ def build_kerma_geometry(etas, mfp, n_fine, is_step=None):
         because the last transition of one gap and the first of the next are
         W/k apart.
 
-    is_step is the desired importance step in mfp.  None (default) gives one
-    transition per gap at its midpoint -- the production map, exp(W) per step.
-    Halving is_step doubles the transitions and halves the step exponent, which
-    is how the second map for the two-map regression test is built.
+    Coarse section: is_step is the desired importance step in mfp.  None
+    (default) gives one transition per gap at its midpoint -- the production
+    map, exp(W) per step.  Halving is_step doubles the transitions and halves
+    the step exponent, which is how the second map for the two-map regression
+    test is built.
 
-    Why that test matters: splitting and Russian roulette are unbiased by
-    construction, so two importance maps MUST agree.  Disagreement is proof of
-    a bug and nothing else.  It is the only validation available on a material
-    with no external reference, and it is what exposed a lost forced-detection
-    score per split event at 287 sigma.
+    Fine section: fine_is_step works the same way, EXCEPT the default (None)
+    is k=0 -- no transitions at all, one flat group from the core out to the
+    last fine detector, at a FIXED importance of exp(fine[-1]) rather than
+    exp(0).  That fixed value is deliberate and load-bearing: with zero
+    transitions inside the fine section there is nothing to derive it from,
+    and exp(fine[-1]) is what makes the split crossing into the first coarse
+    group come out to exp(W) like every other crossing, matching the
+    validated production map exactly (12.6.8: "the fine section needs no
+    population control; forced detection alone is already efficient at
+    shallow depth"). Passing a real fine_is_step switches to the general
+    exp(eta)-from-zero scheme throughout, including the first group, which is
+    a genuinely different map, not a finer version of the same one -- built
+    to test whether IS reaching the primary via lTLE (12.6.28) closes any of
+    the residual gap against Sun et al. 2025's much finer weight window.
+
+    Why the two-map regression test matters: splitting and Russian roulette
+    are unbiased by construction, so two importance maps MUST agree.
+    Disagreement is proof of a bug and nothing else.  It is the only
+    validation available on a material with no external reference, and it is
+    what exposed a lost forced-detection score per split event at 287 sigma.
     """
     fine, coarse = etas[:n_fine], etas[n_fine:]
     radii, scoring = [], []
 
+    # trans_at[i] = (radii index, eta) for every importance transition
+    trans_at = []
+    prev = 0.0
     for e in fine:
+        W = e - prev
+        k = max(1, int(round(W / fine_is_step))) if fine_is_step else 0
+        for j in range(k):
+            eta_t = prev + (2 * j + 1) * W / (2.0 * k)
+            radii.append(eta_t * mfp)
+            trans_at.append((len(radii) - 1, eta_t))
         r = e * mfp
         radii += [r - SHELL_T / 2, r + SHELL_T / 2]
         scoring.append(len(radii) - 1)
+        prev = e
 
-    # trans_at[i] = (radii index, eta) for every importance transition
-    trans_at = []
-    prev = fine[-1]
     for e in coarse:
         W = e - prev
         k = 1 if not is_step else max(1, int(round(W / is_step)))
@@ -173,7 +196,11 @@ def build_kerma_geometry(etas, mfp, n_fine, is_step=None):
 
     # A group runs from the region just inside one transition to the region
     # ending at the next; its importance is exp(eta) at its own inner edge.
-    groups, start, imp_eta = [], 0, fine[-1]
+    # See the fine_is_step discussion above for why the starting value is
+    # NOT simply exp(0) when the fine section carries no transitions of its
+    # own -- that case needs the fixed exp(fine[-1]) instead.
+    groups, start = [], 0
+    imp_eta = 0.0 if fine_is_step else fine[-1]
     for idx, eta_t in trans_at:
         groups.append((start, idx, math.exp(imp_eta)))
         start, imp_eta = idx + 1, eta_t
@@ -252,21 +279,30 @@ def check_kerma(radii, scoring, groups, mfp, etas):
     assert all(b >= a for a, b in zip(imps, imps[1:])), "importance not monotonic"
 
 
-def check_kerma_text(txt, radii, scoring):
+def check_kerma_text(txt, radii, scoring, estimator="FD"):
     """
     Checks on the RENDERED input, not just the region arithmetic.
 
     The structural checks above all passed on the inputs that silently ran in
     track-length mode: the geometry and the importance map were correct, an
     estimator-selecting key was simply absent.  A missing key is invisible to
-    any check that only looks at indices, so verify the emitted text too.
+    any check that only looks at indices, so verify the emitted text too --
+    and, now that lTLE is a deliberate choice rather than only an accident
+    (12.6.28), verify the OTHER direction too: an lTLE request must not
+    silently carry the FD key along with it, or the primary gets double-
+    scored wherever fine_is_step has split it (see build_kerma_geometry).
     """
-    assert f"Default FD geometry = {FD_GEOM_NAME}" in txt, \
-        "FD geometry key missing -- egs_kerma would fall back to track-length"
-    assert f"name    = {FD_GEOM_NAME}" in txt, "FD envelope geometry not emitted"
-    r_out = radii[scoring[-1]]
-    assert f"radii   = {r_out:.6f}" in txt, \
-        "FD envelope does not enclose the outermost detector"
+    if estimator == "FD":
+        assert f"Default FD geometry = {FD_GEOM_NAME}" in txt, \
+            "FD geometry key missing -- egs_kerma would fall back to track-length"
+        assert f"name    = {FD_GEOM_NAME}" in txt, "FD envelope geometry not emitted"
+        r_out = radii[scoring[-1]]
+        assert f"radii   = {r_out:.6f}" in txt, \
+            "FD envelope does not enclose the outermost detector"
+    else:
+        assert "Default FD geometry" not in txt, \
+            "estimator=lTLE requested but the FD key is still present -- " \
+            "would double-score any primary split by fine_is_step"
 
 
 def check_shield(radii, scoring, combing, mfp, etas):
@@ -396,13 +432,32 @@ def source_block(energy, seeds):
 :stop rng definition:"""
 
 
-def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None):
-    radii, scoring, groups = build_kerma_geometry(etas, mfp, n_fine, is_step)
+def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None,
+               fine_is_step=None, estimator="FD"):
+    if fine_is_step and estimator == "FD":
+        sys.exit(
+            "error: --fine-is-step requires --estimator lTLE.\n"
+            "       FD fires once per free path and scores the complete\n"
+            "       remaining trajectory in that one firing; splitting an\n"
+            "       undeviated primary in the fine section makes every\n"
+            "       resulting copy re-fire along the same already-scored\n"
+            "       ray, double-counting it (12.6.28). lTLE has no such\n"
+            "       property -- it only scores actual shell crossings, so\n"
+            "       splitting is safe there. This is not a warning: an FD\n"
+            "       run with fine_is_step active is silently wrong, not\n"
+            "       merely noisier, so it refuses to generate one.")
+    radii, scoring, groups = build_kerma_geometry(etas, mfp, n_fine, is_step, fine_is_step)
     check_kerma(radii, scoring, groups, mfp, etas)
     gname = f"{mat}_sphere"
     geom, media = media_blocks(mat, radii, scoring, gname)
     vols = [f"{shell_volume(e, mfp):.4E}" for e in etas]
     imp = " \\\n".join(f"        {a:5d} {b:5d}  {i:.5E}" for a, b, i in groups)
+    # Transition etas, derived straight from the groups actually built (not
+    # re-derived from etas/n_fine) so this stays correct under any is_step /
+    # fine_is_step combination, including fine-section subdivision.
+    trans_etas = [math.log(i) for _, _, i in groups[1:]]
+    fine_note = (" (including the fine section)" if fine_is_step else
+                 " -- fine section is one flat group, no transitions there")
     hdr = f"""##############################################################################
 # egs_kerma buildup factors: {energy} MeV photons, {mat} sphere, to {etas[-1]:.0f} mfp
 #
@@ -411,13 +466,13 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 # mfp = {mfp} cm      {len(etas)} scoring shells ({n_fine} fine + {len(etas)-n_fine} coarse)
 # geometry: {len(radii)} regions (0 = core, {len(radii)-1} = outer absorber)
 #
-# Importance map: I = exp(eta) at each group's INNER edge.  The coarse section
-# is grouped in threes [material, detector, material] so that every importance
-# transition falls midway between detectors and never on one -- a transition
-# coincident with a detector corrupts that detector's score (worth 1.2% at
-# 10 mfp when it was first found).
+# Importance map: I = exp(eta) at each group's INNER edge.  Groups are built
+# so that every importance transition falls midway between detectors and
+# never on one -- a transition coincident with a detector corrupts that
+# detector's score (worth 1.2% at 10 mfp when it was first found).
 #
-# Transitions at eta = {", ".join(f"{0.5*(etas[n_fine-1+j]+etas[n_fine+j]):.1f}" for j in range(min(4,len(etas)-n_fine)))} ... mfp
+# {len(groups)} groups, {len(trans_etas)} transitions{fine_note}.
+# Transitions at eta = {", ".join(f"{e:.2f}" for e in trans_etas[:6])}{" ..." if len(trans_etas) > 6 else ""} mfp
 #
 # REQUIRES the IS lost-FD-score fix (branch fix-egs_kerma-is-lost-fd-score,
 # commit 409e460b).  Without it every result is biased low in proportion to
@@ -436,7 +491,7 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 
 {geom}
 
-{fd_envelope_block(radii, scoring)}
+{fd_envelope_block(radii, scoring) if estimator == "FD" else ""}
 
     simulation geometry = {gname}
 
@@ -451,10 +506,11 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
     score primaries = yes
     verbose = yes
 
-    # Without this key egs_kerma reverts silently to track-length scoring.
-    # Confirm "Forced detection (FD):  ON" in the .egslog before trusting a run.
-    Default FD geometry = {FD_GEOM_NAME}
-
+{("    # Without this key egs_kerma reverts silently to track-length scoring.\n"
+  "    # Confirm \"Forced detection (FD):  ON\" in the .egslog before trusting a run.\n"
+  f"    Default FD geometry = {FD_GEOM_NAME}\n") if estimator == "FD" else
+ ("    # estimator = lTLE, chosen deliberately (fine_is_step requires it --\n"
+  "    # see 12.6.28). Confirm \"Forced detection (FD):  OFF\" in the .egslog.\n")}
     :start calculation geometry:
         geometry name = {gname}
         scoring regions = \\
@@ -476,7 +532,7 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 
 {TRANSPORT}
 """
-    check_kerma_text(hdr, radii, scoring)
+    check_kerma_text(hdr, radii, scoring, estimator)
     return hdr, dict(regions=len(radii), scoring=scoring, groups=groups)
 
 
@@ -585,11 +641,28 @@ def main():
     p.add_argument("--max-mfp", type=float, default=100.0)
     p.add_argument("--ncase", default="384e9")
     p.add_argument("--is-step", type=float, default=None, metavar="MFP",
-                   help="egs_kerma importance step in mfp; default = one "
-                        "transition per detector gap (the production map). "
-                        "Halve it to build the second map for the two-map "
-                        "regression test, e.g. --is-step 2.5 against a 5 mfp "
-                        "detector spacing.")
+                   help="egs_kerma coarse-section importance step in mfp; "
+                        "default = one transition per detector gap (the "
+                        "production map). Halve it to build the second map "
+                        "for the two-map regression test, e.g. --is-step 2.5 "
+                        "against a 5 mfp detector spacing.")
+    p.add_argument("--fine-is-step", type=float, default=None, metavar="MFP",
+                   help="egs_kerma fine-section importance step in mfp; "
+                        "default = none (one flat group, no transitions -- "
+                        "the validated production map). A real value "
+                        "subdivides the fine section the same way --is-step "
+                        "subdivides the coarse one, e.g. --fine-is-step 0.5 "
+                        "for one transition per 0.5 mfp detector gap, "
+                        "matching Sun et al. 2025's ~1 mfp cell spacing. "
+                        "Requires lTLE (omit 'Default FD geometry' downstream, "
+                        "or the primary will be double-scored by FD -- see "
+                        "12.6.28 in the project log) unless left at the "
+                        "default.")
+    p.add_argument("--estimator", default="FD", choices=["FD", "lTLE"],
+                   help="egs_kerma scoring estimator; default FD. lTLE is "
+                        "required (not merely allowed) whenever "
+                        "--fine-is-step is set -- generation refuses "
+                        "otherwise, see the note there.")
     p.add_argument("--bunches", type=int, default=6400)
     p.add_argument("--per-bunch", type=int, default=1000000)
     p.add_argument("--comb-spacing", type=float, default=10.0)
@@ -623,7 +696,8 @@ def main():
 
     if a.code in ("kerma", "both"):
         txt, info = emit_kerma(a.material, a.energy, mfp, etas, n_fine,
-                               a.ncase, a.emuen, a.seeds, a.is_step)
+                               a.ncase, a.emuen, a.seeds, a.is_step,
+                               a.fine_is_step, a.estimator)
         fn = f"{tag}_kerma.egsinp"
         open(fn, "w").write(txt)
         print(f"{fn}: {info['regions']} regions, {len(info['scoring'])} scoring, "
