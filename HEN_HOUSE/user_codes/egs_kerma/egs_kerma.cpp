@@ -121,7 +121,9 @@ public:
         imp_active(false),
         m_primary(0.0), m_tot(0.0),
         prev_ir_imp(-1),
-        n_split_events(0), n_cap_events(0), max_stack_needed(0) {
+        n_split_events(0), n_cap_events(0), max_stack_needed(0),
+        forced_collision(false),
+        fc_found(false), fc_Lambda(0), fc_x(0,0,0), fc_ireg(-1) {
         Eph_ave = 0.0;
         Nph = 0.0;
         Eph_sc  = 0.0;
@@ -240,7 +242,7 @@ public:
                     if (kerma_r[ig]) {
                         kerma_r[ig]->score(ir,weightedEmuen);
                     }
-                    if (kerma_p[ig] && (is_scatter_correction ? !latch : (latch != 0))) {
+                    if (kerma_p[ig] && (is_scatter_correction ? isPrimary(latch) : !isPrimary(latch))) {
                         kerma_p[ig]->score(ir,weightedEmuen);
                         if (is_scatter_correction) {
                             Eph_sc_p += the_stack->wt[np]*E;
@@ -291,7 +293,7 @@ public:
          * score_primaries (Kpri/Kscat identification).  Done whenever
          * either feature is active so the two are fully independent.
          *********************************************************************/
-        if ((score_primaries || imp_active) &&
+        if ((score_primaries || imp_active || forced_collision) &&
             (iarg == EGS_Application::AfterPair    ||
              iarg == EGS_Application::AfterCompton ||
              iarg == EGS_Application::AfterPhoto   ||
@@ -310,7 +312,18 @@ public:
          * :PNEWENERGY:), leaving prev_ir_imp stale for crossings 2, 3, ... */
         if (iarg == AfterTransport && !iq && ir >= 0) {
             int latch = the_stack->latch[np];
-            if (latch && prev_ir_imp >= 0 && ir != prev_ir_imp
+            /* Primaries (latch==0) are excluded from IS: splitting an
+             * undeviated primary would fire a second, redundant
+             * deterministic ray-trace along the same already-scored ray,
+             * inflating K (5.3.1-class bug).
+             *
+             * latch is masked via isPrimary() rather than compared bare:
+             * forced collision's NO_FD_FLAG (bit 29) makes latch nonzero on
+             * a particle that is still fully primary (merely staged across
+             * an importance-group boundary), and a bare `latch` truthy
+             * check would wrongly let ordinary geometry-IS act on it too --
+             * double variance reduction on the same lineage. */
+            if (!isPrimary(latch) && prev_ir_imp >= 0 && ir != prev_ir_imp
                     && ig < (int)region_importance.size()
                     && prev_ir_imp < (int)region_importance[ig].size()
                     && ir          < (int)region_importance[ig].size()) {
@@ -484,11 +497,12 @@ public:
         TODO: Use region labels to define sensitive regions
 
      */
-    int scoreInCV() {
+    int scoreInCV(bool do_score = true) {
 
         int np    = the_stack->np-1;
 
         if (the_stack->E[np] < the_bounds->pcut) {
+            fc_found = false;
             return 0;
         }
 
@@ -497,11 +511,13 @@ public:
         // if (latch != 0) egsInformation("latch = %d\n",latch);
 
         // Track energy of scoring photons
-        Eph_sc += the_stack->E[np]*the_stack->wt[np];
-        Nsc    += the_stack->wt[np];
-        if (score_primaries && !latch){
-          Eph_sc_p += the_stack->E[np]*the_stack->wt[np];
-          Nsc_p    += the_stack->wt[np];
+        if (do_score) {
+            Eph_sc += the_stack->E[np]*the_stack->wt[np];
+            Nsc    += the_stack->wt[np];
+            if (score_primaries && isPrimary(latch)) {
+              Eph_sc_p += the_stack->E[np]*the_stack->wt[np];
+              Nsc_p    += the_stack->wt[np];
+            }
         }
 
         EGS_Vector x(the_stack->x[np],the_stack->y[np],the_stack->z[np]);
@@ -509,12 +525,29 @@ public:
 
         int ireg = the_stack->ir[np]-2, newmed = geometry->medium(ireg);
 
+        /* Forced-collision group-boundary detection: always run, regardless
+         * of do_score -- this trace is the only place fc_Lambda/fc_x/fc_ireg
+         * get refreshed, and selectPhotonMFP's decomposition needs them
+         * fresh on every call, scored or not (see the member declaration
+         * comment and the egs_shield comparison this mirrors). */
+        fc_found = false;
+        bool fc_track = forced_collision && imp_active
+                         && ig < (int)region_importance.size()
+                         && ireg < (int)region_importance[ig].size();
+        EGS_Float fc_I_start = fc_track ? region_importance[ig][ireg] : 0.0;
+
         EGS_Float tstep;
         int inew;
         int imed = -1;
         EGS_Float gmfp, sigma = 0, cohfac = 1, mu_cv = 0;
         EGS_Float gle = the_epcont->gle, wt_att = 1, Lambda_to_CV = 0;
         double Lambda = 0, t_sc_tot = 0;
+        /* Independent, NEVER decremented total optical depth -- Lambda above
+         * is deliberately reduced by scoring-shell path length ("path
+         * outside scoring volume", for the CV-specific formula below) and is
+         * therefore NOT a faithful accumulator of total distance traveled.
+         * Forced collision needs the true total. */
+        double fc_Lambda_accum = 0;
         double t_sc[2*n_scoring_r[ig]];
         int   ir_sc[2*n_scoring_r[ig]];
         int n_ir_sc = 0;
@@ -546,6 +579,7 @@ public:
                 inew = geometry->howfar(ireg,x,u,tstep,&newmed);
 
                 Lambda += tstep*sigma;// keep track of path outside scoring volume
+                fc_Lambda_accum += tstep*sigma;
 
                 if (is_sensitive[ig][ireg]) {   //in cavity, get path through it
                     ir_sc[n_ir_sc]  = ireg;
@@ -566,6 +600,19 @@ public:
 
                 ireg = inew;
                 x += u*tstep;
+
+                // Forced collision: record the FIRST importance-group
+                // boundary crossed, then keep going -- the K_pri/K_tot
+                // trace must run the full ray regardless (see the member
+                // comment on fc_found).
+                if (fc_track && !fc_found
+                        && ireg < (int)region_importance[ig].size()
+                        && fabs(region_importance[ig][ireg] - fc_I_start) > 1e-10) {
+                    fc_found  = true;
+                    fc_Lambda = fc_Lambda_accum;
+                    fc_x      = x;
+                    fc_ireg   = ireg;
+                }
 
                 // Leaves CV?
                 if (inside_cv && !is_sensitive[ig][ireg]) {
@@ -596,35 +643,37 @@ public:
                     //--------------------------------------------
                     // score kerma in scoring region
                     //--------------------------------------------
-                    if (kerma_r[ig]) {
-                        kerma_r[ig]->score(ir_sc[i],weightedEdepCV);
-                    }
-                    if (kerma_p[ig] && (is_scatter_correction ? !latch : (latch != 0))) {
-                        kerma_p[ig]->score(ir_sc[i],weightedEdepCV);
-                    }
-                    //--------------------------------------------
-                    // score photon fluence
-                    //--------------------------------------------
-                    if (flug) {
-                        flugT[ig]->score(ir_sc[i],weightedExpAtt);
-                        EGS_Float e = the_stack->E[np];
-                        if (flu_s) {
-                            e = log(e);
+                    if (do_score) {
+                        if (kerma_r[ig]) {
+                            kerma_r[ig]->score(ir_sc[i],weightedEdepCV);
                         }
-                        EGS_Float ae;
-                        int je;
-                        if (e > flu_xmin && e <= flu_xmax) {
-                            ae = flu_a*e + flu_b;
-                            je = min((int)ae,flu_nbin-1);
-                            EGS_ScoringArray *aux = flug[ig];
-                            aux->score(je,weightedExpAtt);
+                        if (kerma_p[ig] && (is_scatter_correction ? isPrimary(latch) : !isPrimary(latch))) {
+                            kerma_p[ig]->score(ir_sc[i],weightedEdepCV);
                         }
-                    }
-                    else {
-                        if (flugT) {
+                        //--------------------------------------------
+                        // score photon fluence
+                        //--------------------------------------------
+                        if (flug) {
                             flugT[ig]->score(ir_sc[i],weightedExpAtt);
+                            EGS_Float e = the_stack->E[np];
+                            if (flu_s) {
+                                e = log(e);
+                            }
+                            EGS_Float ae;
+                            int je;
+                            if (e > flu_xmin && e <= flu_xmax) {
+                                ae = flu_a*e + flu_b;
+                                je = min((int)ae,flu_nbin-1);
+                                EGS_ScoringArray *aux = flug[ig];
+                                aux->score(je,weightedExpAtt);
+                            }
                         }
+                        else {
+                            if (flugT) {
+                                flugT[ig]->score(ir_sc[i],weightedExpAtt);
+                            }
 
+                        }
                     }
 
                     // Include as attenuation to next scoring region
@@ -637,7 +686,9 @@ public:
                 exp_CV     = exp(-mu_cv*t_sc_tot);
                 exp_Att    = sigma ? exp_Lambda_to_CV*(1-exp_CV)/mu_cv : exp_Lambda_to_CV*t_sc_tot;
                 edepCV     = emuen*exp_Att;
-                kerma->score(ig,wt*edepCV);
+                if (do_score) {
+                    kerma->score(ig,wt*edepCV);
+                }
                 // Ray-tracing continues
                 if (re_enters_cv) {
                     wt_att *= exp_Lambda;
@@ -1365,6 +1416,28 @@ public:
         bool is_copy = the_stack->latch[np] & IS_COPY_FLAG;
         if (is_copy) the_stack->latch[np] &= ~IS_COPY_FLAG;
 
+        int  latch   = the_stack->latch[np];
+        bool primary = isPrimary(latch);
+        /* Score at most once per primary lineage: NO_FD_FLAG, once set,
+         * means the single deterministic full-range trace from the true
+         * source has already booked this particle's K_pri/K_tot
+         * contribution to every shell.  Repeating it for a forced-collision
+         * descendant would double-count every shell beyond the first
+         * split -- see the member comment on fc_found and the egs_shield
+         * comparison in the report (§13.9).
+         *
+         * NO_FD_FLAG applies ONLY while the particle is still primary.  A
+         * Compton-scattered photon keeps its parent's stack slot (COMPT
+         * modifies energy/direction in place; it does not reset latch), so
+         * it inherits whatever NO_FD_FLAG bit its primary parent had set --
+         * but its OWN K_tot contribution is genuinely new information and
+         * must always be scored, regardless of that inherited bit.  Gating
+         * the suppression on primary as well as the flag is what keeps
+         * this from silently zeroing every scattered contribution to K_tot
+         * (caught by the regression test: K/Kpri came back exactly 1 at
+         * every shell before this fix). */
+        bool do_score = !primary || !(latch & NO_FD_FLAG);
+
         EGS_Float tstep = TSTEP_MAX;
         //******************************************************************
         // FD Track-length kerma estimation for photons entering or aimed
@@ -1377,9 +1450,92 @@ public:
                 (is_sensitive[ig][ireg] ||
                  fd_geom->howfar(-1,x,u,tstep,&newmed)>= 0 ||
                  fd_geom->isInside(x))) {
-            /* Photon in or aimed at cavity */
-            int errK = scoreInCV();
+            /* Photon in or aimed at cavity.  Always traced (do_score decides
+             * only whether the result is booked) -- this call is also the
+             * only place fc_Lambda/fc_x/fc_ireg get refreshed, and forced
+             * collision below needs them fresh on every call. */
+            int errK = scoreInCV(do_score);
+            if (primary && do_score) {
+                the_stack->latch[np] |= NO_FD_FLAG;
+                latch = the_stack->latch[np];
+            }
         }
+        else {
+            fc_found = false;
+        }
+
+        //******************************************************************
+        // Forced collision between importance-group boundaries (report
+        // §13.9, CLAUDE.md §12.6.20/28).  Only still-primary particles
+        // (latch==0 modulo NO_FD_FLAG) are eligible -- once a particle has
+        // genuinely interacted, it is scattered and follows ordinary
+        // geometry-IS at region crossings (the AfterTransport block above),
+        // never forced collision.
+        //
+        //     uncollided   w * T          relocated to the group-boundary
+        //                                 exit, T = exp(-Lambda)
+        //     collided     w * (1 - T)    forced to interact inside the
+        //                                 segment, at tau = -ln(1-xi(1-T))
+        //
+        // Weights sum to w, unbiased by construction (same formulas as
+        // egs_shield's validated implementation, cross-checked against it
+        // directly rather than re-derived independently).
+        //
+        // Stack placement: the collided branch is PUSHED as a new top-of-
+        // stack entry.  Per the documented np-not-reread mechanism
+        // (CLAUDE.md §9 item 19), it becomes Fortran's NP when this
+        // function returns -- deliberately, since the dpmfp returned below
+        // is meant for it.  The uncollided branch is edited in place at the
+        // ORIGINAL np slot (repositioned to the boundary, weight reduced)
+        // and left un-pushed: it stays dormant below the new top until
+        // SHOWER's dispatch loop (egsnrc.mortran:6708-6714) naturally
+        // resumes it later, entering :PNEWENERGY: fresh -- at which point
+        // this same hook recurses for the next segment.  Verified against
+        // egsnrc.mortran before writing this: NP is a live pointer into the
+        // STACK common block (egs_interface2.h:73), not a cached copy;
+        // PEIG/EIG are freshly read from E(NP) at the top of every PHOTON
+        // call (egsnrc.mortran:6454-6455); and this push happens before any
+        // per-iteration Mortran locals (IROLD, MEDIUM, GMFPR0) are cached
+        // for the current :PNEWENERGY: iteration, so there is no stale
+        // mid-step state to inherit -- unlike the original np bug, which
+        // pushed mid-step, after that state was already loaded.
+        //******************************************************************
+        if (forced_collision && primary && fc_found) {
+            EGS_Float T = exp(-fc_Lambda);
+            int avail = MXSTACK - the_stack->np;
+            // T==1 leaves the collided branch weightless and the sampling
+            // below degenerate; T==0 leaves nothing to bank; avail<=0 means
+            // no room to push -- all three mean the segment is not worth
+            // (or not safe to) force, so fall through to analog sampling.
+            if (T > 1e-300 && T < 1.0 - 1e-9 && avail > 0) {
+                EGS_Float w = the_stack->wt[np];
+
+                int nn = the_stack->np;
+                the_stack->x[nn]=the_stack->x[np]; the_stack->y[nn]=the_stack->y[np];
+                the_stack->z[nn]=the_stack->z[np]; the_stack->u[nn]=the_stack->u[np];
+                the_stack->v[nn]=the_stack->v[np]; the_stack->w[nn]=the_stack->w[np];
+                the_stack->E[nn]=the_stack->E[np]; the_stack->wt[nn]=w*(1.0-T);
+                the_stack->iq[nn]=0;               the_stack->ir[nn]=the_stack->ir[np];
+                the_stack->latch[nn]=latch;        // still primary; NO_FD inherited if set
+                the_stack->dnear[nn]=the_stack->dnear[np];
+                the_stack->np++;
+
+                the_stack->wt[np] = w*T;
+                the_stack->x[np]  = fc_x.x; the_stack->y[np] = fc_x.y; the_stack->z[np] = fc_x.z;
+                the_stack->ir[np] = fc_ireg + 2;
+                // Repositioned by direct write, not by normal transport, so
+                // any stale "distance to nearest boundary" hint from the old
+                // position is no longer safe -- a HOWFAR implementation could
+                // skip a boundary check it should have performed.  0 forces
+                // the next howfar call to check properly.
+                the_stack->dnear[np] = 0;
+
+                EGS_Float xi = rndm->getUniform();
+                dpmfp = -log(1.0 - xi*(1.0 - T));
+                return;
+            }
+        }
+
         EGS_I64 iraw = rndm->getUInt64();
         if (iraw) {
             /* 64-bit integer path: τ_max = 64·ln2 ≈ 44.4 mfp (xoshiro256++) */
@@ -1542,6 +1698,38 @@ private:
      * Bit 30 is used to stay clear of physics latch bits. */
     static const int IS_COPY_FLAG = 1 << 30;
 
+    /* Forced collision between importance-group boundaries -- see
+     * deep-penetration-buildup-factors.md §13.9 and CLAUDE.md §12.6.20/28
+     * for the derivation.  Distinct bit from IS_COPY_FLAG: bit 29 marks
+     * "K_pri/K_tot already scored for this primary lineage", set once after
+     * the first scoreInCV() call for a still-primary particle and inherited
+     * by every forced-collision descendant, so the single deterministic
+     * full-range trace from the true source is never repeated (repeating it
+     * would double-count every shell beyond the first split — see the
+     * egs_shield comparison in the report).  Every "is this still a
+     * primary" test must mask this bit off via isPrimary(), exactly as
+     * egs_shield's own NO_FD_FLAG requires. */
+    static const int NO_FD_FLAG = 1 << 29;
+    static bool isPrimary(int latch) {
+        return (latch & ~NO_FD_FLAG) == 0;
+    }
+
+    bool       forced_collision;  // input: 'forced collision'
+
+    /* Set by scoreInCV()'s ray-trace as a side effect of its (always-run,
+     * regardless of do_score) full pass to geometry exit: records the FIRST
+     * importance-group-boundary crossing found along the way.  Mirrors
+     * egs_shield's fc_found/fc_Lambda/fc_x/fc_ireg exactly.  Must be reset
+     * and re-traced on EVERY primary call, scored or not -- skipping the
+     * trace when scoring is suppressed left these holding a PREVIOUS
+     * particle's values in egs_shield and produced a measured,
+     * depth-growing bias (+0.03% to +0.09%) before trace and score were
+     * separated there. */
+    bool       fc_found;
+    double     fc_Lambda;
+    EGS_Vector fc_x;
+    int        fc_ireg;
+
     static string revision;
 };
 
@@ -1567,6 +1755,7 @@ int EGS_KermaApplication::initScoring() {
         score_primaries      = options->getInput("score primaries",    choice,0);
         verbose              = options->getInput("verbose",            choice,0);
         is_scatter_correction = options->getInput("scatter correction", choice,1);
+        forced_collision      = options->getInput("forced collision",   choice,0);
 
 
         /* Fatal error if deprecated key is present */
