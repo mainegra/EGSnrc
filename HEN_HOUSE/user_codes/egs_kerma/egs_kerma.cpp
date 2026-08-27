@@ -581,6 +581,16 @@ public:
                 Lambda += tstep*sigma;// keep track of path outside scoring volume
                 fc_Lambda_accum += tstep*sigma;
 
+                /* Unbiased early exit -- see the FD_LAMBDA_CUTOFF member
+                 * comment. Overriding inew reuses the existing, proven
+                 * "photon left the geometry" termination path below rather
+                 * than adding a new one; whatever shell is currently being
+                 * accumulated (if any) still gets its correct, if utterly
+                 * negligible, partial credit. */
+                if (fc_Lambda_accum > FD_LAMBDA_CUTOFF) {
+                    inew = -1;
+                }
+
                 if (is_sensitive[ig][ireg]) {   //in cavity, get path through it
                     ir_sc[n_ir_sc]  = ireg;
                     t_sc[n_ir_sc]   = tstep;
@@ -1713,6 +1723,24 @@ private:
     static bool isPrimary(int latch) {
         return (latch & ~NO_FD_FLAG) == 0;
     }
+
+    /* scoreInCV()'s ray-trace accumulates optical depth at the particle's
+     * OWN current energy, not at the 1 MeV reference the geometry's radii
+     * happen to be labelled in.  A multiply-Compton-scattered photon near
+     * iron's K-edge (~10-30 keV) has a cross section ~150-200x the 1 MeV
+     * value, so an entirely ordinary few-cm stretch of iron can read as
+     * thousands of "mfp" -- ordinary, correct physics, not a stuck or
+     * runaway trace.  But once Lambda is this large, exp(-Lambda) is
+     * already zero to double precision (underflow begins around e^-745),
+     * so every further shell the trace would score costs real iterations
+     * for exactly zero contribution.  Forced collision manufactures far
+     * more of the low-energy, multiply-scattered population that triggers
+     * this than analog transport ever would.  100 mfp gives exp(-100) ~
+     * 4e-44 -- already many orders of magnitude below anything else being
+     * summed -- so cutting the trace off there is unbiased, not an
+     * approximation with real consequences.  Same principle as the
+     * existing `cascade weight cutoff` in egs_shield. */
+    static constexpr EGS_Float FD_LAMBDA_CUTOFF = 100.0;
 
     bool       forced_collision;  // input: 'forced collision'
 
