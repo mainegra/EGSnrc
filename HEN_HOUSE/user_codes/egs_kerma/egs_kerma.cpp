@@ -122,6 +122,7 @@ public:
         m_primary(0.0), m_tot(0.0),
         prev_ir_imp(-1),
         n_split_events(0), n_cap_events(0), max_stack_needed(0),
+        forced_collision_max(-1),
         forced_collision(false),
         fc_found(false), fc_Lambda(0), fc_x(0,0,0), fc_ireg(-1) {
         Eph_ave = 0.0;
@@ -1510,7 +1511,8 @@ public:
         // mid-step state to inherit -- unlike the original np bug, which
         // pushed mid-step, after that state was already loaded.
         //******************************************************************
-        if (forced_collision && primary && fc_found) {
+        if (forced_collision && primary && fc_found &&
+                (forced_collision_max < 0 || fcCount(latch) < forced_collision_max)) {
             EGS_Float T = exp(-fc_Lambda);
             int avail = MXSTACK - the_stack->np;
             // T==1 leaves the collided branch weightless and the sampling
@@ -1533,6 +1535,11 @@ public:
                 the_stack->wt[np] = w*T;
                 the_stack->x[np]  = fc_x.x; the_stack->y[np] = fc_x.y; the_stack->z[np] = fc_x.z;
                 the_stack->ir[np] = fc_ireg + 2;
+                // One forcing used against forced_collision_max; only the
+                // uncollided branch's count matters going forward, since it
+                // is the one that will recurse into the next boundary's
+                // forcing decision.
+                the_stack->latch[np] = fcIncrementCount(latch);
                 // Repositioned by direct write, not by normal transport, so
                 // any stale "distance to nearest boundary" hint from the old
                 // position is no longer safe -- a HOWFAR implementation could
@@ -1720,8 +1727,19 @@ private:
      * primary" test must mask this bit off via isPrimary(), exactly as
      * egs_shield's own NO_FD_FLAG requires. */
     static const int NO_FD_FLAG = 1 << 29;
+
+    /* Forced collision's per-lineage forcing count, bits 25-28 (values
+     * 0-15). Declared here, before isPrimary(), because isPrimary() must
+     * mask these bits off too: a still-fully-primary particle that has
+     * merely been forced once or twice has a nonzero count field despite
+     * never having interacted, and an unmasked check would wrongly read it
+     * as scattered the moment the count left 0 -- the same class of trap
+     * NO_FD_FLAG already required a mask for. See the forced_collision_max
+     * member comment below for the full motivation. */
+    static const int FC_COUNT_SHIFT = 25;
+    static const int FC_COUNT_BITS_MASK = 0xF;   // unshifted, 4 bits
     static bool isPrimary(int latch) {
-        return (latch & ~NO_FD_FLAG) == 0;
+        return (latch & ~(NO_FD_FLAG | (FC_COUNT_BITS_MASK << FC_COUNT_SHIFT))) == 0;
     }
 
     /* scoreInCV()'s ray-trace accumulates optical depth at the particle's
@@ -1741,6 +1759,37 @@ private:
      * approximation with real consequences.  Same principle as the
      * existing `cascade weight cutoff` in egs_shield. */
     static constexpr EGS_Float FD_LAMBDA_CUTOFF = 100.0;
+
+    /* Cap on how many times a single primary lineage may be forced-collision
+     * decomposed. Motivation (Ernesto): most of the benefit comes from the
+     * first one or two forcings -- a seed placed at a reasonable depth is
+     * then propagated onward perfectly well by egs_kerma's already-validated
+     * geometry-IS, which is the SAME mechanism, exponential and unbounded,
+     * that turns "many guaranteed seeds" into a population explosion (report
+     * §13.14). Every one of ~19 guaranteed seeds surviving geometry-IS
+     * splitting through all its own remaining transitions is largely
+     * redundant with a seed already placed earlier on the same path; capping
+     * the seed COUNT is a direct, minimal fix for that redundancy, distinct
+     * from (and not a substitute for) the FD_LAMBDA_CUTOFF fix above, which
+     * bounds cost per trace rather than the number of seeds created.
+     *
+     * Stored in latch bits 25-28 (4 bits, values 0-15 -- forced_collision_max
+     * is expected to be small; FC_COUNT_SHIFT/FC_COUNT_BITS_MASK are declared
+     * above, next to isPrimary(), which must mask them too). The ordinary
+     * interaction counter occupying the low bits cannot reach bit 25 in any
+     * practical run. Only the UNCOLLIDED branch's count is ever consulted
+     * (it is the one that recurses into a further forcing decision at the
+     * next boundary); the collided branch's copy is never read once it
+     * interacts, since isPrimary() then excludes it from this logic
+     * entirely. */
+    static int fcCount(int latch) {
+        return (latch >> FC_COUNT_SHIFT) & FC_COUNT_BITS_MASK;
+    }
+    static int fcIncrementCount(int latch) {
+        int c = fcCount(latch) + 1;
+        return (latch & ~(FC_COUNT_BITS_MASK << FC_COUNT_SHIFT)) | (c << FC_COUNT_SHIFT);
+    }
+    int forced_collision_max;  // input: 'forced collision max'; < 0 = unlimited
 
     bool       forced_collision;  // input: 'forced collision'
 
@@ -1784,6 +1833,10 @@ int EGS_KermaApplication::initScoring() {
         verbose              = options->getInput("verbose",            choice,0);
         is_scatter_correction = options->getInput("scatter correction", choice,1);
         forced_collision      = options->getInput("forced collision",   choice,0);
+        options->getInput("forced collision max", forced_collision_max);
+        // getInput(key,int&) leaves the variable untouched if the key is
+        // absent, so the -1 ("unlimited") default set in the constructor
+        // survives unless the input explicitly overrides it.
 
 
         /* Fatal error if deprecated key is present */
