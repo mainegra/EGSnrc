@@ -433,7 +433,8 @@ def source_block(energy, seeds):
 
 
 def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None,
-               fine_is_step=None, estimator="FD"):
+               fine_is_step=None, estimator="FD", forced_collision=False,
+               forced_collision_max=None):
     if fine_is_step and estimator == "FD":
         sys.exit(
             "error: --fine-is-step requires --estimator lTLE.\n"
@@ -446,6 +447,15 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
             "       splitting is safe there. This is not a warning: an FD\n"
             "       run with fine_is_step active is silently wrong, not\n"
             "       merely noisier, so it refuses to generate one.")
+    if forced_collision and estimator != "FD":
+        sys.exit(
+            "error: --forced-collision requires --estimator FD.\n"
+            "       Forced-collision decomposition only fires from inside\n"
+            "       the FD ray-trace (scoreInCV()); under lTLE fc_found is\n"
+            "       never set, so the option would silently do nothing\n"
+            "       rather than error, which is worse than refusing to\n"
+            "       generate. See deep-penetration-buildup-factors.md\n"
+            "       SS13.9-13.15.")
     radii, scoring, groups = build_kerma_geometry(etas, mfp, n_fine, is_step, fine_is_step)
     check_kerma(radii, scoring, groups, mfp, etas)
     gname = f"{mat}_sphere"
@@ -506,11 +516,18 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
     score primaries = yes
     verbose = yes
 
-{("    # Without this key egs_kerma reverts silently to track-length scoring.\n"
-  "    # Confirm \"Forced detection (FD):  ON\" in the .egslog before trusting a run.\n"
-  f"    Default FD geometry = {FD_GEOM_NAME}\n") if estimator == "FD" else
- ("    # estimator = lTLE, chosen deliberately (fine_is_step requires it --\n"
-  "    # see 12.6.28). Confirm \"Forced detection (FD):  OFF\" in the .egslog.\n")}
+{(("    # Without this key egs_kerma reverts silently to track-length scoring.\n"
+   "    # Confirm \"Forced detection (FD):  ON\" in the .egslog before trusting a run.\n"
+   f"    Default FD geometry = {FD_GEOM_NAME}\n") if estimator == "FD" else
+  ("    # estimator = lTLE, chosen deliberately (fine_is_step requires it --\n"
+   "    # see 12.6.28). Confirm \"Forced detection (FD):  OFF\" in the .egslog.\n")
+ ) + (
+  ("    forced collision = yes\n"
+   + (f"    forced collision max = {forced_collision_max}\n" if forced_collision_max is not None else
+      "    # forced collision max not set -- UNLIMITED forcings per primary.\n"
+      "    # This does not complete in any practical time (SS13.13-13.14 of\n"
+      "    # the report); 1-2 is what makes it usable (SS13.15).\n")
+  ) if forced_collision else "")}
     :start calculation geometry:
         geometry name = {gname}
         scoring regions = \\
@@ -537,7 +554,8 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
 
 
 def emit_shield(mat, energy, mfp, etas, nb, npb, emuen, seeds,
-                comb_spacing, comb_start, cutoff, comb_target):
+                comb_spacing, comb_start, cutoff, comb_target,
+                forced_collision=False):
     radii, scoring, combing, combs = build_shield_geometry(
         etas, mfp, comb_spacing, comb_start)
     check_shield(radii, scoring, combing, mfp, etas)
@@ -617,7 +635,8 @@ def emit_shield(mat, energy, mfp, etas, nb, npb, emuen, seeds,
 
     bunch statistics   = yes
     cascade diagnostic = yes
-
+{("\n    forced collision   = yes\n"
+  "    primary crossing diagnostic = yes\n") if forced_collision else ""}
 :stop scoring options:
 
 :start variance reduction:
@@ -670,6 +689,22 @@ def main():
                    help="first combing eta; default = first coarse midpoint")
     p.add_argument("--cutoff", default="1e-50")
     p.add_argument("--comb-target", type=int, default=0)
+    p.add_argument("--forced-collision", action="store_true",
+                   help="enable forced collision (both codes). egs_kerma: "
+                        "requires --estimator FD, refuses otherwise -- FC "
+                        "decomposition only fires from inside the FD "
+                        "ray-trace (scoreInCV()), so under lTLE it would "
+                        "silently do nothing rather than error, which is "
+                        "worse than refusing to generate. See "
+                        "deep-penetration-buildup-factors.md SS13.9-13.15.")
+    p.add_argument("--forced-collision-max", type=int, default=None,
+                   metavar="N",
+                   help="egs_kerma only: cap forcings per primary lineage. "
+                        "Default unlimited, which does not complete in any "
+                        "practical time (SS13.13-13.14) -- 1-2 is what makes "
+                        "it usable (SS13.15). Ignored (with a warning) for "
+                        "--code shield, which has no such cap in its own "
+                        "implementation.")
     p.add_argument("--emuen", default="$EGS_HOME/egs_kerma/emuen_rho_air_1keV-20MeV.data")
     p.add_argument("--seeds", nargs=2, type=int, default=[13579, 24680])
     p.add_argument("--prefix", default=None)
@@ -694,10 +729,16 @@ def main():
     n_fine = sum(1 for e in etas if e <= 10.0 + 1e-9)
     tag = a.prefix or f"BUF_{a.material}_{a.energy:g}MeV"
 
+    if a.forced_collision_max is not None and a.code in ("shield", "both"):
+        print(f"warning: --forced-collision-max is egs_kerma-only and is "
+              f"being ignored for the --code shield output "
+              f"(no such cap in its own implementation).", file=sys.stderr)
+
     if a.code in ("kerma", "both"):
         txt, info = emit_kerma(a.material, a.energy, mfp, etas, n_fine,
                                a.ncase, a.emuen, a.seeds, a.is_step,
-                               a.fine_is_step, a.estimator)
+                               a.fine_is_step, a.estimator,
+                               a.forced_collision, a.forced_collision_max)
         fn = f"{tag}_kerma.egsinp"
         open(fn, "w").write(txt)
         print(f"{fn}: {info['regions']} regions, {len(info['scoring'])} scoring, "
@@ -705,7 +746,8 @@ def main():
     if a.code in ("shield", "both"):
         txt, info = emit_shield(a.material, a.energy, mfp, etas, a.bunches,
                                 a.per_bunch, a.emuen, a.seeds, a.comb_spacing,
-                                a.comb_start, a.cutoff, a.comb_target)
+                                a.comb_start, a.cutoff, a.comb_target,
+                                a.forced_collision)
         fn = f"{tag}_shield.egsinp"
         open(fn, "w").write(txt)
         print(f"{fn}: {info['regions']} regions, {len(info['scoring'])} scoring, "
