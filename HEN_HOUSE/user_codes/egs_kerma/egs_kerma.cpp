@@ -2690,6 +2690,32 @@ void EGS_KermaApplication::describeSimulation() {
     }
     egsInformation("\n");
 
+    /* Report this explicitly, not just as a line in the input echo: a
+     * missing/misread VR setting silent in the log has already cost this
+     * project real time once (the FD key omission, report SS12.6.17) --
+     * forced collision gets the same treatment egs_shield's own VR summary
+     * already applies to its version of this option. */
+    if (forced_collision) {
+        egsInformation(" Forced collision:              ON\n");
+        if (forced_collision_max < 0) {
+            egsInformation("   UNLIMITED forcings per primary -- does not complete in any\n"
+                           "   practical time (report SS13.13-13.14).\n");
+        }
+        else if (forced_collision_max == 1) {
+            egsInformation("   Fires at most ONCE per source photon"
+                           " (forced collision max = 1)\n");
+        }
+        else {
+            egsInformation("   Fires at most %d times per source photon"
+                           " (forced collision max = %d)\n",
+                           forced_collision_max, forced_collision_max);
+        }
+    }
+    else {
+        egsInformation(" Forced collision:              OFF\n");
+    }
+    egsInformation("\n");
+
     if (score_primaries) {
         egsInformation(" Correlated K/Kpri scoring:    ON\n");
         if (is_scatter_correction)
