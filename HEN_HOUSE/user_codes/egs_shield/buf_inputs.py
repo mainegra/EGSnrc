@@ -468,6 +468,33 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
     trans_etas = [math.log(i) for _, _, i in groups[1:]]
     fine_note = (" (including the fine section)" if fine_is_step else
                  " -- fine section is one flat group, no transitions there")
+    # Built as plain variables, not inline in the f-string below: an f-string
+    # {...} expression cannot contain a backslash before Python 3.12 (PEP 701
+    # lifted that restriction). This bit us on synthia's older interpreter --
+    # egsbox's newer one never caught it. Keep every "{...}" substitution
+    # site in the template below to a bare variable reference for exactly
+    # this reason, even though it works fine locally without this.
+    if estimator == "FD":
+        estimator_block = (
+            "    # Without this key egs_kerma reverts silently to track-length scoring.\n"
+            "    # Confirm \"Forced detection (FD):  ON\" in the .egslog before trusting a run.\n"
+            f"    Default FD geometry = {FD_GEOM_NAME}\n")
+    else:
+        estimator_block = (
+            "    # estimator = lTLE, chosen deliberately (fine_is_step requires it --\n"
+            "    # see 12.6.28). Confirm \"Forced detection (FD):  OFF\" in the .egslog.\n")
+    if forced_collision:
+        if forced_collision_max is not None:
+            fc_max_line = f"    forced collision max = {forced_collision_max}\n"
+        else:
+            fc_max_line = (
+                "    # forced collision max not set -- UNLIMITED forcings per primary.\n"
+                "    # This does not complete in any practical time (SS13.13-13.14 of\n"
+                "    # the report); 1-2 is what makes it usable (SS13.15).\n")
+        fc_block = "    forced collision = yes\n" + fc_max_line
+    else:
+        fc_block = ""
+    scoring_options_extra = estimator_block + fc_block
     hdr = f"""##############################################################################
 # egs_kerma buildup factors: {energy} MeV photons, {mat} sphere, to {etas[-1]:.0f} mfp
 #
@@ -516,18 +543,7 @@ def emit_kerma(mat, energy, mfp, etas, n_fine, ncase, emuen, seeds, is_step=None
     score primaries = yes
     verbose = yes
 
-{(("    # Without this key egs_kerma reverts silently to track-length scoring.\n"
-   "    # Confirm \"Forced detection (FD):  ON\" in the .egslog before trusting a run.\n"
-   f"    Default FD geometry = {FD_GEOM_NAME}\n") if estimator == "FD" else
-  ("    # estimator = lTLE, chosen deliberately (fine_is_step requires it --\n"
-   "    # see 12.6.28). Confirm \"Forced detection (FD):  OFF\" in the .egslog.\n")
- ) + (
-  ("    forced collision = yes\n"
-   + (f"    forced collision max = {forced_collision_max}\n" if forced_collision_max is not None else
-      "    # forced collision max not set -- UNLIMITED forcings per primary.\n"
-      "    # This does not complete in any practical time (SS13.13-13.14 of\n"
-      "    # the report); 1-2 is what makes it usable (SS13.15).\n")
-  ) if forced_collision else "")}
+{scoring_options_extra}
     :start calculation geometry:
         geometry name = {gname}
         scoring regions = \\
@@ -559,6 +575,11 @@ def emit_shield(mat, energy, mfp, etas, nb, npb, emuen, seeds,
     radii, scoring, combing, combs = build_shield_geometry(
         etas, mfp, comb_spacing, comb_start)
     check_shield(radii, scoring, combing, mfp, etas)
+    # Plain variable, not inline in the f-string below -- see the matching
+    # comment in emit_kerma() for why (pre-3.12 f-strings reject a backslash
+    # inside "{...}", even nested inside quoted literals).
+    fc_block = ("\n    forced collision   = yes\n"
+                "    primary crossing diagnostic = yes\n") if forced_collision else ""
     gname = f"{mat}_sphere"
     geom, media = media_blocks(mat, radii, scoring, gname)
     vols = [f"{shell_volume(e, mfp):.4E}" for e in etas]
@@ -635,8 +656,7 @@ def emit_shield(mat, energy, mfp, etas, nb, npb, emuen, seeds,
 
     bunch statistics   = yes
     cascade diagnostic = yes
-{("\n    forced collision   = yes\n"
-  "    primary crossing diagnostic = yes\n") if forced_collision else ""}
+{fc_block}
 :stop scoring options:
 
 :start variance reduction:
