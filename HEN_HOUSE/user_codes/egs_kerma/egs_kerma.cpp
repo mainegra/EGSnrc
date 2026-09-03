@@ -1882,11 +1882,11 @@ int EGS_KermaApplication::initScoring() {
 
             /* Process inputs */
 
-            string gname, cgname;
+            string gname, cgname, apertString;
             int err  = aux->getInput("geometry name",gname);
             int errc = aux->getInput("FD geometry",cgname);
-            vector<int> apert;
-            int err4 = aux->getInput("excluded regions",apert);
+            vector<int> apert; // Excluded regions
+            int err4 = aux->getInput("excluded regions",apertString);
             vector<EGS_Float> cmass;
             int err2 = aux->getInput("scoring region volumes",cmass);
 
@@ -1909,8 +1909,20 @@ int EGS_KermaApplication::initScoring() {
                                           "incremental scoring regions"
                                          };
 
+            /* Read region-list inputs as strings, not vector<int>: entries
+             * may be region LABELS (set via 'set label' in the geometry
+             * definition -- e.g. EGS_CDGeometry auto-expanding a label for
+             * every placement) as well as literal region numbers.
+             * getNumberRegions()/getLabelRegions() below resolve both from
+             * the same string -- see egs_base_geometry.{h,cpp}. This needs
+             * the geometry object *before* region-list parsing, so the
+             * geometry lookup that used to run after this switch has moved
+             * up here. (Restores label support dropped by 90ddf75c "Add
+             * primary kerma scoring to egs_kerma", which rewrote this
+             * function against a base that predated it.) */
+            string cavString;
             for (int ir_choice = 0; ir_choice < 4; ir_choice++) {
-                if (!aux->getInput(reg_inp_key[ir_choice], dummy_regs)) {
+                if (!aux->getInput(reg_inp_key[ir_choice], cavString)) {
                     k = Kind(ir_choice);
                     break;
                 }
@@ -1920,138 +1932,160 @@ int EGS_KermaApplication::initScoring() {
 
             bool mass_per_group = false;
 
-            switch (k) {
-            case individual: {
-                // Read entries for individual regions
-                cav = dummy_regs;
-                break;
+            EGS_BaseGeometry::setActiveGeometryList(app_index);
+            EGS_BaseGeometry *g = EGS_BaseGeometry::getGeometry(gname);
+            if (!g) {
+                egsWarning("initScoring: no geometry named %s -->"
+                           " input ignored\n",gname.c_str());
+                err1 = 1;
             }
-            case ranges: {
-                // Read pairs of contiguous range of regions
-                vector<int> pairs;
-                err1 = aux->getInput("scoring region ranges",pairs);
-                if (!err1 && pairs.size() % 2 == 0) {
-                    vector<EGS_Float> le_mass;
-                    //User provided one mass value for each group
-                    if (pairs.size()/2 == cmass.size()) {
-                        le_mass = cmass;
-                        cmass.clear();
-                        mass_per_group = true;
-                    }
-                    unsigned int j = 0, valid_pair = 0;
-                    while (j < pairs.size()) {
-                        int ireg = pairs[j], ereg = pairs[++j];
-                        if (ereg > ireg) {
-                            for (unsigned i = ireg; i <= ereg; i++) {
-                                cav.push_back(i);
-                                if (mass_per_group) {
-                                    cmass.push_back(le_mass[valid_pair]);
-                                }
-                            }
-                            j++;
-                            valid_pair++;
-                        }
-                        else {
-                            egsFatal("initScoring: wrong scoring region range'\n"
-                                     " on %d-th pair: %d %d\n",
-                                     valid_pair+1,ireg,ereg);
-                        }
-                    }
-                    n_region_groups.push_back(pairs.size());
+            else {
+                g->getNumberRegions(apertString, apert);
+                g->getLabelRegions(apertString, apert);
+
+                switch (k) {
+                case individual: {
+                    // Read entries for individual regions
+                    g->getNumberRegions(cavString, cav);
+                    g->getLabelRegions(cavString, cav);
+                    break;
                 }
-                else {
-                    egsFatal("initScoring: Error in 'scoring region ranges' input\n");
-                }
-                break;
-            }
-            case groups: {
-                vector <int> d_start, d_stop;
-                int err1g = aux->getInput("scoring start region",d_start);
-                int err2g = aux->getInput("scoring stop region",d_stop);
-                if (!err1g && !err2g) {
-                    err1 = 0;
-                    if (d_start.size() == d_stop.size()) { // groups of regions
+                case ranges: {
+                    // Read pairs of contiguous range of regions
+                    vector<int> pairs;
+                    g->getNumberRegions(cavString, pairs);
+                    g->getLabelRegions(cavString, pairs);
+                    if (pairs.size() % 2 == 0) {
                         vector<EGS_Float> le_mass;
                         //User provided one mass value for each group
-                        if (d_start.size() == cmass.size()) {
+                        if (pairs.size()/2 == cmass.size()) {
                             le_mass = cmass;
                             cmass.clear();
                             mass_per_group = true;
                         }
-                        int valid_pair = 0;
-                        for (int i=0; i<d_start.size(); i++) {
-                            int ir = d_start[i], fr = d_stop[i];
-                            if (fr > ir) {
-                                for (int ireg=ir; ireg<=fr; ireg++) {
-                                    cav.push_back(ireg);
+                        unsigned int j = 0, valid_pair = 0;
+                        while (j < pairs.size()) {
+                            int ireg = pairs[j], ereg = pairs[++j];
+                            if (ereg > ireg) {
+                                for (unsigned i = ireg; i <= ereg; i++) {
+                                    cav.push_back(i);
                                     if (mass_per_group) {
                                         cmass.push_back(le_mass[valid_pair]);
                                     }
                                 }
+                                j++;
                                 valid_pair++;
                             }
                             else {
-                                egsFatal("initScoring: wrong 'start/stop scoring regions'\n"
-                                         " on %d-th triplet: %d %d\n",
-                                         valid_pair+1,ir,fr);
+                                egsFatal("initScoring: wrong scoring region range'\n"
+                                         " on %d-th pair: %d %d\n",
+                                         valid_pair+1,ireg,ereg);
                             }
                         }
-                        n_region_groups.push_back(d_start.size());
+                        n_region_groups.push_back(pairs.size());
                     }
                     else {
-                        egsFatal("initScoring: Mismatch in start and stop"
-                                 " scoring region groups !!!\n");
+                        egsFatal("initScoring: Error in 'scoring region ranges' input\n");
                     }
+                    break;
                 }
-                break;
-            }
-            case incremental: {
-                // Check if groups of equally spaced regions desired
-                vector<int> triplets;
-                err1 = aux->getInput("incremental scoring regions",triplets);
-                if (!err1 && triplets.size() % 3 == 0) {
-                    vector<EGS_Float> le_mass;
-                    //User provided one mass value for each group
-                    if (triplets.size()/3 == cmass.size()) {
-                        le_mass = cmass;
-                        cmass.clear();
-                        mass_per_group = true;
-                    }
-                    unsigned int j = 0, valid_triplet = 0;
-                    while (j < triplets.size()) {
-                        int ireg = triplets[j],
-                            ereg = triplets[++j],
-                            dreg = triplets[++j];
-                        if (ereg > ireg) {
-                            for (unsigned i = ireg; i <= ereg; i = i + dreg) {
-                                cav.push_back(i);
-                                if (mass_per_group) {
-                                    cmass.push_back(le_mass[valid_triplet]);
+                case groups: {
+                    vector <int> d_start, d_stop;
+                    g->getNumberRegions(cavString, d_start);
+                    g->getLabelRegions(cavString, d_start);
+
+                    int err2g = aux->getInput("scoring stop region",cavString);
+                    if (!err2g) {
+                        g->getNumberRegions(cavString, d_stop);
+                        g->getLabelRegions(cavString, d_stop);
+
+                        err1 = 0;
+                        if (d_start.size() == d_stop.size()) { // groups of regions
+                            vector<EGS_Float> le_mass;
+                            //User provided one mass value for each group
+                            if (d_start.size() == cmass.size()) {
+                                le_mass = cmass;
+                                cmass.clear();
+                                mass_per_group = true;
+                            }
+                            int valid_pair = 0;
+                            for (int i=0; i<d_start.size(); i++) {
+                                int ir = d_start[i], fr = d_stop[i];
+                                if (fr > ir) {
+                                    for (int ireg=ir; ireg<=fr; ireg++) {
+                                        cav.push_back(ireg);
+                                        if (mass_per_group) {
+                                            cmass.push_back(le_mass[valid_pair]);
+                                        }
+                                    }
+                                    valid_pair++;
+                                }
+                                else {
+                                    egsFatal("initScoring: wrong 'start/stop scoring regions'\n"
+                                             " on %d-th triplet: %d %d\n",
+                                             valid_pair+1,ir,fr);
                                 }
                             }
-                            j++;
-                            valid_triplet++;
+                            n_region_groups.push_back(d_start.size());
                         }
                         else {
-                            egsFatal("initScoring: wrong 'incremental scoring regions'\n"
-                                     " on %d-th triplet: %d %d %d\n",
-                                     valid_triplet+1,ireg,ereg,dreg);
+                            egsFatal("initScoring: Mismatch in start and stop"
+                                     " scoring region groups !!!\n");
                         }
                     }
-                    n_region_groups.push_back(triplets.size());
-                    //egsInformation("---> Scoring from region %d to %d in %d regions increments\n",
-                    //         triplets[0], triplets[1], triplets[2]);
+                    break;
                 }
-                else {
-                    egsFatal("initScoring: missing/wrong "
-                             "'incremental scoring regions' input\n"
-                             "Expected triplets: ir_min ir_max ir_delta ...\n");
+                case incremental: {
+                    // Check if groups of equally spaced regions desired
+                    vector<int> triplets;
+                    g->getNumberRegions(cavString, triplets);
+                    // Turn off sorting of the region list since it's not
+                    // just regions -- entries are (start, end, delta).
+                    g->getLabelRegions(cavString, triplets, false);
+                    if (triplets.size() % 3 == 0) {
+                        vector<EGS_Float> le_mass;
+                        //User provided one mass value for each group
+                        if (triplets.size()/3 == cmass.size()) {
+                            le_mass = cmass;
+                            cmass.clear();
+                            mass_per_group = true;
+                        }
+                        unsigned int j = 0, valid_triplet = 0;
+                        while (j < triplets.size()) {
+                            int ireg = triplets[j],
+                                ereg = triplets[++j],
+                                dreg = triplets[++j];
+                            if (ereg > ireg) {
+                                for (unsigned i = ireg; i <= ereg; i = i + dreg) {
+                                    cav.push_back(i);
+                                    if (mass_per_group) {
+                                        cmass.push_back(le_mass[valid_triplet]);
+                                    }
+                                }
+                                j++;
+                                valid_triplet++;
+                            }
+                            else {
+                                egsFatal("initScoring: wrong 'incremental scoring regions'\n"
+                                         " on %d-th triplet: %d %d %d\n",
+                                         valid_triplet+1,ireg,ereg,dreg);
+                            }
+                        }
+                        n_region_groups.push_back(triplets.size());
+                        //egsInformation("---> Scoring from region %d to %d in %d regions increments\n",
+                        //         triplets[0], triplets[1], triplets[2]);
+                    }
+                    else {
+                        egsFatal("initScoring: missing/wrong "
+                                 "'incremental scoring regions' input\n"
+                                 "Expected triplets: ir_min ir_max ir_delta ...\n");
+                        err1 = 1;
+                    }
+                    break;
+                }
+                default:
                     err1 = 1;
                 }
-                break;
-            }
-            default:
-                err1 = 1;
             }
 
             bool total_volume_only = false;
@@ -2092,11 +2126,10 @@ int EGS_KermaApplication::initScoring() {
                 egsWarning("  --> input ignored\n");
             }
             else {
-                EGS_BaseGeometry::setActiveGeometryList(app_index);
-                EGS_BaseGeometry *g = EGS_BaseGeometry::getGeometry(gname);
-                if (!g) egsWarning("initScoring: no geometry named %s -->"
-                                       " input ignored\n",gname.c_str());
-                else {
+                // g was already resolved above (region-list parsing needs it
+                // for label lookups); err1 would be set and we wouldn't be
+                // here if it were null, so no need to re-look it up.
+                {
                     int nreg = g->regions();
                     int *regs = new int [cav.size()];
                     EGS_Float *m_g  = new EGS_Float [cmass.size()];
