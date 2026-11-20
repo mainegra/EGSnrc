@@ -1498,8 +1498,13 @@ public:
          * the suppression on primary as well as the flag is what keeps
          * this from silently zeroing every scattered contribution to K_tot
          * (caught by the regression test: K/Kpri came back exactly 1 at
-         * every shell before this fix). */
-        bool do_score = !primary || !(latch & NO_FD_FLAG);
+         * every shell before this fix).
+         *
+         * Only with forced collision on: without it, latch is incremented
+         * on interactions only if primaries are scored or IS is active, so
+         * a scattered photon can still look primary and would inherit the
+         * flag. */
+        bool do_score = !forced_collision || !primary || !(latch & NO_FD_FLAG);
 
         EGS_Float tstep = TSTEP_MAX;
         //******************************************************************
@@ -1518,7 +1523,7 @@ public:
              * only place fc_Lambda/fc_x/fc_ireg get refreshed, and forced
              * collision below needs them fresh on every call. */
             int errK = scoreInCV(do_score);
-            if (primary && do_score) {
+            if (forced_collision && primary && do_score) {
                 the_stack->latch[np] |= NO_FD_FLAG;
                 latch = the_stack->latch[np];
             }
